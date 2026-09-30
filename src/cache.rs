@@ -313,12 +313,13 @@ impl CacheStore {
         )
     }
 
-    /// Legacy profile-scope writer kept for cache-format compatibility tests.
+    /// Test-only writer for exercising legacy profile-scope cache migration.
     ///
-    /// Current Claude production observations are session-local and do not
-    /// call this path because a profile directory is not serving-account
-    /// proof.
-    pub fn save_statusline_observation_with_quota_scope(
+    /// Production Claude observations are session-local; keeping this helper
+    /// out of normal builds prevents new code from depending on the retired
+    /// profile-scope quota path.
+    #[cfg(test)]
+    fn save_statusline_observation_with_quota_scope(
         &self,
         provider: Provider,
         snapshot: ProviderSnapshot,
