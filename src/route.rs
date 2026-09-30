@@ -458,7 +458,6 @@ mod tests {
         );
     }
 
-
     /// Every provider omp can name is collected through omp's own usage layer;
     /// the plugin does not need a provider-specific compatibility entry.
     #[test]
