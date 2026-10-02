@@ -1636,9 +1636,9 @@ fn vendor_nesting(
                 .filter(|pane| !overlay_ids.contains(pane.pane_id.as_str())),
         )
         .collect();
-    let mut groups: BTreeMap<(String, u8), Vec<&AgentPane>> = BTreeMap::new();
+    let mut groups: BTreeMap<(String, u8, String), Vec<&AgentPane>> = BTreeMap::new();
     for pane in &panes {
-        if pane.workspace_id.is_empty() || !shares_login_quota(pane.harness) {
+        if pane.workspace_id.is_empty() || !shares_login_quota(pane) {
             continue;
         }
         groups.entry(nest_group_key(pane)).or_default().push(*pane);
@@ -1648,7 +1648,18 @@ fn vendor_nesting(
     let mut last_children = BTreeSet::new();
     let mut stack = BTreeMap::new();
     let mut header_icon = BTreeMap::new();
-    for ((_, index), members) in &groups {
+    let stride = crate::cli::AgentSelection::SUPPORTED.len() as u8;
+    let mut previous: Option<(&String, u8)> = None;
+    let mut subgroup = 0u8;
+    for ((workspace, harness_index, _), members) in &groups {
+        subgroup = match previous {
+            Some(seen) if seen == (workspace, *harness_index) => subgroup + 1,
+            _ => 0,
+        };
+        previous = Some((workspace, *harness_index));
+        let index = harness_index
+            .saturating_add(subgroup.saturating_mul(stride))
+            .min(98);
         let min_head = members
             .iter()
             .map(|pane| published_headroom(pane, tokens))
@@ -1710,17 +1721,94 @@ fn vendor_nesting(
     }
 }
 
-pub(crate) fn shares_login_quota(harness: Harness) -> bool {
-    matches!(
-        harness,
-        Harness::Grok | Harness::Codex | Harness::Devin | Harness::OpenCode | Harness::Cursor
-    )
+pub(crate) fn shares_login_quota(pane: &AgentPane) -> bool {
+    quota_scope(pane).is_some()
+}
+
+fn quota_scope(pane: &AgentPane) -> Option<String> {
+    match pane.harness {
+        Harness::Grok
+        | Harness::Codex
+        | Harness::Devin
+        | Harness::OpenCode
+        | Harness::Cursor
+        | Harness::Muse
+        | Harness::Claude => Some(String::new()),
+        Harness::Agy => agy_quota_scope(pane),
+        Harness::Omp | Harness::Pi | Harness::Kilo => {
+            pane.session.as_ref()?;
+            memoized_scope(pane, session_quota_scope)
+        }
+    }
+}
+
+fn agy_quota_scope(pane: &AgentPane) -> Option<String> {
+    let model = pane
+        .tokens
+        .get("quota_model")
+        .map(String::as_str)
+        .or_else(|| {
+            pane.tokens
+                .get("quota_provider_model")
+                .and_then(|label| label.split_once('/'))
+                .map(|(_, model)| model)
+        })?;
+    crate::providers::agy::pool_name(model).map(str::to_string)
+}
+
+fn session_quota_scope(pane: &AgentPane) -> Option<String> {
+    if pane.harness == Harness::Omp {
+        let path = pane.session.as_ref()?.path()?;
+        let route = crate::omp::resolve_with_session(Some(path), |_, _| None);
+        return matches!(route.resolution, crate::model::Resolution::Subscription(_))
+            .then_some(route.evidence?)
+            .map(|evidence| {
+                format!(
+                    "{}\0{}",
+                    evidence.provider_id,
+                    evidence.account_pin.unwrap_or_default()
+                )
+            });
+    }
+    match crate::route::resolve(pane) {
+        crate::model::Resolution::Subscription(target) => Some(target.cache_identity()),
+        _ => None,
+    }
+}
+
+fn memoized_scope(
+    pane: &AgentPane,
+    compute: impl FnOnce(&AgentPane) -> Option<String>,
+) -> Option<String> {
+    use std::sync::{Mutex, OnceLock};
+    use std::time::{Duration, Instant};
+    type Scopes = BTreeMap<String, (Instant, Option<String>)>;
+    static SCOPES: OnceLock<Mutex<Scopes>> = OnceLock::new();
+    const FRESH: Duration = Duration::from_secs(2);
+
+    let key = format!("{}\0{:?}", pane.pane_id, pane.session);
+    let scopes = SCOPES.get_or_init(Default::default);
+    if let Some((seen, scope)) = scopes.lock().ok()?.get(&key) {
+        if seen.elapsed() < FRESH {
+            return scope.clone();
+        }
+    }
+    let scope = compute(pane);
+    scopes
+        .lock()
+        .ok()?
+        .insert(key, (Instant::now(), scope.clone()));
+    scope
 }
 
 /// Same-Space same-vendor group. Grok is one login-scoped vendor: the
 /// collector reads one `auth.json`, so two Grok tabs in a Space share 5h/7d.
-pub(crate) fn nest_group_key(pane: &AgentPane) -> (String, u8) {
-    (pane.workspace_id.clone(), harness_stack_index(pane.harness))
+pub(crate) fn nest_group_key(pane: &AgentPane) -> (String, u8, String) {
+    (
+        pane.workspace_id.clone(),
+        harness_stack_index(pane.harness),
+        quota_scope(pane).unwrap_or_default(),
+    )
 }
 
 fn vendor_group_head(members: &[&AgentPane]) -> String {
@@ -2739,7 +2827,7 @@ mod tests {
     }
 
     #[test]
-    fn claude_panes_in_one_space_do_not_nest() {
+    fn claude_panes_in_one_space_nest_under_one_head() {
         let panes = vec![
             AgentPane {
                 pane_id: "w1:p1".to_string(),
@@ -2768,6 +2856,129 @@ mod tests {
                 focused: false,
             },
         ];
+        let nesting = vendor_nesting(&panes, &panes, &[]);
+        assert_eq!(
+            nesting.heads,
+            BTreeSet::from(["w1:p1".to_string()]),
+            "{:?}",
+            nesting.heads
+        );
+        assert_eq!(
+            nesting.children,
+            BTreeSet::from(["w1:p2".to_string()]),
+            "{:?}",
+            nesting.children
+        );
+    }
+
+    fn grouped_pane(id: &str, harness: Harness, tokens: &[(&str, &str)]) -> AgentPane {
+        AgentPane {
+            pane_id: id.to_string(),
+            workspace_id: "w1".to_string(),
+            cwd: String::new(),
+            title: String::new(),
+            harness,
+            session: None,
+            session_summary: String::new(),
+            topic: String::new(),
+            tokens: tokens
+                .iter()
+                .map(|(name, value)| (name.to_string(), value.to_string()))
+                .collect(),
+            status: AgentStatus::Idle,
+            focused: false,
+        }
+    }
+
+    #[test]
+    fn muse_panes_in_one_space_nest_under_one_head() {
+        let panes = vec![
+            grouped_pane("w1:p1", Harness::Muse, &[]),
+            grouped_pane("w1:p2", Harness::Muse, &[]),
+        ];
+        let nesting = vendor_nesting(&panes, &panes, &[]);
+        assert_eq!(nesting.heads, BTreeSet::from(["w1:p1".to_string()]));
+        assert_eq!(nesting.children, BTreeSet::from(["w1:p2".to_string()]));
+    }
+
+    #[test]
+    fn agy_panes_nest_only_within_one_quota_pool() {
+        let panes = vec![
+            grouped_pane("w1:p1", Harness::Agy, &[("quota_model", "gemini-3-pro")]),
+            grouped_pane(
+                "w1:p2",
+                Harness::Agy,
+                &[("quota_provider_model", "Agy/gemini-3-flash")],
+            ),
+            grouped_pane("w1:p3", Harness::Agy, &[("quota_model", "claude-opus-4")]),
+        ];
+        let nesting = vendor_nesting(&panes, &panes, &[]);
+        assert_eq!(nesting.heads, BTreeSet::from(["w1:p1".to_string()]));
+        assert_eq!(nesting.children, BTreeSet::from(["w1:p2".to_string()]));
+        assert_ne!(nest_group_key(&panes[0]), nest_group_key(&panes[2]));
+    }
+
+    #[test]
+    fn agy_panes_with_an_unknown_model_stay_standalone() {
+        let panes = [
+            grouped_pane("w1:p1", Harness::Agy, &[]),
+            grouped_pane("w1:p2", Harness::Agy, &[("quota_model", "mystery")]),
+        ];
+        assert!(!shares_login_quota(&panes[0]));
+        assert!(!shares_login_quota(&panes[1]));
+    }
+
+    #[test]
+    fn pi_and_kilo_panes_without_a_session_stay_standalone() {
+        let panes = vec![
+            grouped_pane("w1:p1", Harness::Pi, &[]),
+            grouped_pane("w1:p2", Harness::Pi, &[]),
+            grouped_pane("w1:p3", Harness::Kilo, &[]),
+            grouped_pane("w1:p4", Harness::Kilo, &[]),
+        ];
+        let nesting = vendor_nesting(&panes, &panes, &[]);
+        assert!(nesting.heads.is_empty(), "{:?}", nesting.heads);
+        assert!(nesting.children.is_empty(), "{:?}", nesting.children);
+    }
+
+    #[test]
+    fn two_quota_pools_in_one_space_never_share_a_stack_index() {
+        let mut first = grouped_pane("w1:p1", Harness::Agy, &[("quota_model", "gemini-3-pro")]);
+        first
+            .tokens
+            .insert("quota_headroom".to_string(), "050".to_string());
+        let mut second = first.clone();
+        second.pane_id = "w1:p2".to_string();
+        let mut third = grouped_pane("w1:p3", Harness::Agy, &[("quota_model", "claude-opus-4")]);
+        third
+            .tokens
+            .insert("quota_headroom".to_string(), "050".to_string());
+        let mut fourth = third.clone();
+        fourth.pane_id = "w1:p4".to_string();
+        let panes = vec![first, second, third, fourth];
+        let nesting = vendor_nesting(&panes, &panes, &[]);
+        let index = |id: &str| nesting.stack[id][3..5].to_string();
+        assert_eq!(index("w1:p1"), index("w1:p2"));
+        assert_eq!(index("w1:p3"), index("w1:p4"));
+        assert_ne!(index("w1:p1"), index("w1:p3"));
+    }
+
+    #[test]
+    fn omp_panes_without_a_billable_session_stay_standalone() {
+        let pane = |id: &str| AgentPane {
+            pane_id: id.to_string(),
+            workspace_id: "w1".to_string(),
+            cwd: String::new(),
+            title: String::new(),
+            harness: Harness::Omp,
+            session: None,
+            session_summary: String::new(),
+            topic: String::new(),
+            tokens: BTreeMap::new(),
+            status: AgentStatus::Idle,
+            focused: false,
+        };
+        let panes = vec![pane("w1:p1"), pane("w1:p2")];
         let nesting = vendor_nesting(&panes, &panes, &[]);
         assert!(nesting.heads.is_empty(), "{:?}", nesting.heads);
         assert!(nesting.children.is_empty(), "{:?}", nesting.children);

@@ -56,6 +56,21 @@ id = "focused-tab-agent-quota-refresh"
 on = "tab.focused"
 command = ["sh", "-c", "exec \"$HERDR_PLUGIN_ROOT/target/release/herdr-agent-usage\" focus"]
 
+[[events]]
+id = "closed-pane-agent-quota-layout"
+on = "pane.closed"
+command = ["sh", "-c", "exec \"$HERDR_PLUGIN_ROOT/target/release/herdr-agent-usage\" layout"]
+
+[[events]]
+id = "moved-pane-agent-quota-layout"
+on = "pane.moved"
+command = ["sh", "-c", "exec \"$HERDR_PLUGIN_ROOT/target/release/herdr-agent-usage\" layout"]
+
+[[events]]
+id = "closed-tab-agent-quota-layout"
+on = "tab.closed"
+command = ["sh", "-c", "exec \"$HERDR_PLUGIN_ROOT/target/release/herdr-agent-usage\" layout"]
+
 [[panes]]
 id = "dashboard"
 title = "Agent quota"

@@ -68,6 +68,7 @@ pub enum Command {
     Event,
     /// Handle a Herdr pane-focus event. Invoked by the plugin's focus hook.
     Focus,
+    Layout,
     /// Render the quota dashboard shown in the Herdr popup pane.
     Dashboard,
     /// Install, inspect, or remove this plugin's sidebar rows and collectors.

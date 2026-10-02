@@ -415,6 +415,25 @@ mod tests {
         );
     }
 
+    #[test]
+    fn omp_panes_group_by_the_provider_they_bill() {
+        let first = tempdir().unwrap();
+        let second = tempdir().unwrap();
+        let claude_a = omp_pane(&omp_session(first.path(), "session-anthropic.jsonl"));
+        let claude_b = omp_pane(&omp_session(second.path(), "session-anthropic.jsonl"));
+        let grok = omp_pane(&omp_session(first.path(), "session-xai-oauth.jsonl"));
+        assert!(crate::herdr::shares_login_quota(&claude_a));
+        assert!(crate::herdr::shares_login_quota(&grok));
+        assert_eq!(
+            crate::herdr::nest_group_key(&claude_a),
+            crate::herdr::nest_group_key(&claude_b)
+        );
+        assert_ne!(
+            crate::herdr::nest_group_key(&claude_a),
+            crate::herdr::nest_group_key(&grok)
+        );
+    }
+
     /// Two omp panes on one provider share its quota target but not a model:
     /// each identity comes from that pane's own transcript, including one long
     /// enough to be read as a window.

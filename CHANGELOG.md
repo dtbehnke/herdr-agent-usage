@@ -39,8 +39,21 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   untouched in the cache and in the dashboard, a label that names something
   else (`Daily`, a provider-specific pool) is never renamed, and a sidebar too
   narrow to meter at all still shows the provider's label.
+- Every agent now shares one 5h/7d/30d row per Space when its tabs draw on
+  the same quota, not only Grok, Codex, Devin, OpenCode, and Cursor. Claude
+  and Muse share by vendor. omp shares by the provider and account its session
+  bills, and Pi and Kilo by the billing target their session resolves to. Agy
+  shares within the Gemini or the third-party pool its model draws from. A tab
+  whose payer is not known yet keeps its own row.
 
 ### Fixed
+
+- Closing a tab, moving it to another Space, quitting its agent, or starting a
+  different agent in it no longer leaves the tabs behind it nested under a
+  vendor head, or without a Space header, until the next refresh. `pane.closed`,
+  `pane.moved`, and `tab.closed`, plus an agent release or switch, republish
+  only the Spaces whose rows no longer match their members. No pane output is
+  read.
 
 - A long omp or Pi session no longer empties its pane. Both harnesses append
   one session to one file, and a transcript past 8 MiB was rejected whole, so

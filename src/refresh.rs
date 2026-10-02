@@ -438,6 +438,19 @@ pub fn event() -> Result<()> {
     let Some(event) = event.as_ref() else {
         return Ok(());
     };
+    let result = handle_event(event);
+    if event_changes_layout(event) {
+        return result.and(relayout(None));
+    }
+    result
+}
+
+fn event_changes_layout(event: &Value) -> bool {
+    find_agent(event).is_none()
+        || find_field(event, &["event", "type"]).is_some_and(|kind| kind.contains("agent_detected"))
+}
+
+fn handle_event(event: &Value) -> Result<()> {
     let Some(agent) = find_agent(event) else {
         return Ok(());
     };
@@ -516,6 +529,58 @@ pub fn focus() -> Result<()> {
     };
     let cache = CacheStore::from_env()?;
     paint_focus_icons(&cache, force_idle.as_deref())
+}
+
+pub fn layout() -> Result<()> {
+    let event = event_json();
+    let seed = event
+        .as_ref()
+        .and_then(|event| find_field(event, &["workspace_id", "workspaceId"]))
+        .map(str::to_owned);
+    relayout(seed)
+}
+
+fn relayout(seed: Option<String>) -> Result<()> {
+    let enabled = AgentSelection::from_args_or_env(&[]);
+    let mut panes = list_agent_panes()?;
+    panes.retain(|pane| enabled.contains(&pane.harness));
+    let mut stale = stale_layout_workspaces(&panes);
+    stale.extend(seed);
+    panes.retain(|pane| stale.contains(&pane.workspace_id));
+    if panes.is_empty() {
+        return Ok(());
+    }
+    let cache = CacheStore::from_env()?;
+    publish_resolved(&cache, &mut panes, None, false, false)
+}
+
+fn stale_layout_workspaces(panes: &[AgentPane]) -> BTreeSet<String> {
+    let mut headers = BTreeMap::<&str, usize>::new();
+    for pane in panes {
+        if pane
+            .tokens
+            .get("quota_group")
+            .is_some_and(|label| !label.trim().is_empty())
+        {
+            *headers.entry(pane.workspace_id.as_str()).or_default() += 1;
+        }
+    }
+    panes
+        .iter()
+        .filter(|pane| {
+            let misnested = crate::herdr::shares_login_quota(pane)
+                && pane_needs_vendor_restyle(
+                    pane,
+                    panes,
+                    representative_pane_id(pane, panes) == pane.pane_id,
+                );
+            let misheaded = !pane.workspace_id.is_empty()
+                && plugin_quota_present(&pane.tokens)
+                && headers.get(pane.workspace_id.as_str()) != Some(&1);
+            misnested || misheaded
+        })
+        .map(|pane| pane.workspace_id.clone())
+        .collect()
 }
 
 /// Fold plugin working/unseen state into each pane's status so icon colour
@@ -1608,7 +1673,7 @@ fn vendor_row_sync_extras(tokens: &[PaneTokens], inventory: &[AgentPane]) -> Vec
             inventory
                 .iter()
                 .find(|pane| pane.pane_id == token.pane_id)
-                .filter(|pane| crate::herdr::shares_login_quota(pane.harness))
+                .filter(|pane| crate::herdr::shares_login_quota(pane))
                 .map(crate::herdr::nest_group_key)
         })
         .collect::<BTreeSet<_>>();
@@ -1616,7 +1681,7 @@ fn vendor_row_sync_extras(tokens: &[PaneTokens], inventory: &[AgentPane]) -> Vec
         .iter()
         .filter(|pane| {
             !published.contains(pane.pane_id.as_str())
-                && crate::herdr::shares_login_quota(pane.harness)
+                && crate::herdr::shares_login_quota(pane)
                 && live_groups.contains(&crate::herdr::nest_group_key(pane))
         })
         .filter_map(|pane| {
@@ -1639,7 +1704,7 @@ fn mark_one_quota_row_per_vendor(tokens: &mut [PaneTokens], panes: &[AgentPane])
         let Some(pane) = panes.iter().find(|pane| pane.pane_id == token.pane_id) else {
             continue;
         };
-        if !crate::herdr::shares_login_quota(pane.harness) {
+        if !crate::herdr::shares_login_quota(pane) {
             continue;
         }
         let representative = representative_pane_id(pane, panes);
@@ -3008,7 +3073,7 @@ mod tests {
     }
 
     #[test]
-    fn claude_panes_keep_their_own_quota_rows() {
+    fn claude_panes_in_one_space_share_one_quota_row() {
         let mut tokens = vec![
             quota_tokens("w1:p1", "Claude", Some(40)),
             quota_tokens("w1:p2", "Claude", Some(12)),
@@ -3019,7 +3084,7 @@ mod tests {
         ];
         mark_one_quota_row_per_vendor(&mut tokens, &panes);
         assert!(tokens[0].show_account_quota);
-        assert!(tokens[1].show_account_quota);
+        assert!(!tokens[1].show_account_quota);
     }
 
     #[test]
@@ -3110,6 +3175,158 @@ mod tests {
             extras.iter().all(|extra| extra.pane_id != "w5:pA"),
             "share tokens already count as account windows: {extras:?}"
         );
+    }
+
+    fn published_pane(
+        id: &str,
+        workspace: &str,
+        harness: Harness,
+        tokens: &[(&str, &str)],
+    ) -> AgentPane {
+        let mut pane = test_pane(id, harness);
+        pane.workspace_id = workspace.to_string();
+        pane.tokens = tokens
+            .iter()
+            .map(|(name, value)| (name.to_string(), value.to_string()))
+            .collect();
+        pane
+    }
+
+    const FLAT_CLAUDE: [(&str, &str); 4] = [
+        ("quota_group", "~"),
+        ("quota_icon", "x"),
+        ("quota_provider_model", "Claude/Opus 5.5"),
+        ("quota_5h_normal", "5h 77%"),
+    ];
+
+    #[test]
+    fn a_nested_head_left_alone_marks_its_space_for_layout() {
+        let survivor = published_pane(
+            "w1:p1",
+            "w1",
+            Harness::Claude,
+            &[
+                ("quota_group", "~"),
+                ("quota_icon", "x"),
+                ("quota_provider", "Claude"),
+                ("quota_share_5h_normal", "5h 77%"),
+            ],
+        );
+        let elsewhere = published_pane("w2:p1", "w2", Harness::Claude, &FLAT_CLAUDE);
+        assert_eq!(
+            stale_layout_workspaces(&[survivor, elsewhere]),
+            BTreeSet::from(["w1".to_string()])
+        );
+    }
+
+    #[test]
+    fn a_steady_flat_pane_needs_no_layout_pass() {
+        let pane = published_pane("w1:p1", "w1", Harness::Claude, &FLAT_CLAUDE);
+        assert!(stale_layout_workspaces(&[pane]).is_empty());
+    }
+
+    #[test]
+    fn a_steady_nested_pair_needs_no_layout_pass() {
+        let head = published_pane(
+            "w1:p1",
+            "w1",
+            Harness::Claude,
+            &[
+                ("quota_group", "~"),
+                ("quota_icon", "x"),
+                ("quota_provider", "Claude"),
+                ("quota_share_5h_normal", "5h 77%"),
+            ],
+        );
+        let child = published_pane(
+            "w1:p2",
+            "w1",
+            Harness::Claude,
+            &[("quota_model", "Opus 5.5")],
+        );
+        assert!(stale_layout_workspaces(&[head, child]).is_empty());
+    }
+
+    #[test]
+    fn a_space_whose_header_pane_left_needs_a_layout_pass() {
+        let survivor = published_pane(
+            "w3:p2",
+            "w3",
+            Harness::Pi,
+            &[("quota_icon", "x"), ("quota_provider_model", "Codex/gpt-5")],
+        );
+        assert_eq!(
+            stale_layout_workspaces(&[survivor]),
+            BTreeSet::from(["w3".to_string()])
+        );
+    }
+
+    #[test]
+    fn a_header_pane_moved_into_a_headed_space_needs_a_layout_pass() {
+        let resident = published_pane("w1:p1", "w1", Harness::Claude, &FLAT_CLAUDE);
+        let moved = published_pane(
+            "w1:p9",
+            "w1",
+            Harness::Pi,
+            &[
+                ("quota_group", "other"),
+                ("quota_icon", "x"),
+                ("quota_provider_model", "Codex/gpt-5"),
+            ],
+        );
+        assert_eq!(
+            stale_layout_workspaces(&[resident, moved]),
+            BTreeSet::from(["w1".to_string()])
+        );
+    }
+
+    #[test]
+    fn a_released_agent_changes_the_layout() {
+        let event = serde_json::json!({
+            "event": "pane_agent_detected",
+            "data": {
+                "type": "pane_agent_detected",
+                "pane_id": "w1:p2",
+                "workspace_id": "w1",
+                "agent": null,
+                "released": true
+            }
+        });
+        assert!(event_changes_layout(&event));
+    }
+
+    #[test]
+    fn another_agent_in_the_same_pane_changes_the_layout() {
+        let event = serde_json::json!({
+            "data": {
+                "type": "pane_agent_detected",
+                "pane_id": "w1:p2",
+                "workspace_id": "w1",
+                "agent": "omp"
+            }
+        });
+        assert!(event_changes_layout(&event));
+    }
+
+    #[test]
+    fn a_status_change_leaves_the_layout_alone() {
+        let event = serde_json::json!({
+            "event": "pane_agent_status_changed",
+            "data": {
+                "type": "pane_agent_status_changed",
+                "pane_id": "w1:p2",
+                "workspace_id": "w1",
+                "agent": "claude",
+                "agent_status": "working"
+            }
+        });
+        assert!(!event_changes_layout(&event));
+    }
+
+    #[test]
+    fn a_pane_the_plugin_never_published_needs_no_layout_pass() {
+        let pane = published_pane("w4:p1", "w4", Harness::Pi, &[]);
+        assert!(stale_layout_workspaces(&[pane]).is_empty());
     }
 
     #[test]
