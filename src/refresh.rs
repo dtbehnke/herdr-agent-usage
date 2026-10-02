@@ -2248,9 +2248,16 @@ mod tests {
                 (account.as_str(), None),
                 ("someone-else", Some("signed-in account changed")),
             ] {
+                // The period must still be running when the test runs: a
+                // fixed reset date turns into an expired window and an empty
+                // row once the calendar passes it.
                 let mut snapshot = ProviderSnapshot::new(
                     Provider::Kilo,
-                    vec![window(WindowKind::Monthly, 20.6, 1_790_950_387)],
+                    vec![window(
+                        WindowKind::Monthly,
+                        20.6,
+                        CacheStore::now_unix() + 20 * 24 * 60 * 60,
+                    )],
                     1,
                 );
                 snapshot.account_id = Some(owner.to_string());
