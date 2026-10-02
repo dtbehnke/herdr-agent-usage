@@ -39,12 +39,22 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   untouched in the cache and in the dashboard, a label that names something
   else (`Daily`, a provider-specific pool) is never renamed, and a sidebar too
   narrow to meter at all still shows the provider's label.
-- Every agent now shares one 5h/7d/30d row per Space when its tabs draw on
-  the same quota, not only Grok, Codex, Devin, OpenCode, and Cursor. Claude
-  and Muse share by vendor. omp shares by the provider and account its session
-  bills, and Pi and Kilo by the billing target their session resolves to. Agy
-  shares within the Gemini or the third-party pool its model draws from. A tab
-  whose payer is not known yet keeps its own row.
+- Every agent now shares one 5h/7d/30d row per Space when its tabs provably
+  draw on the same quota, not only Grok, Codex, Devin, OpenCode, and Cursor.
+  Muse shares by vendor. Claude shares by account: the statusLine hook records
+  a digest of the account and organization in `oauthAccount` from the
+  `.claude.json` of the session's own `CLAUDE_CONFIG_DIR`, so two profiles on
+  two logins keep two rows and two profiles on one login share one. Claude tabs on one account
+  also show the newest reading any of them received, instead of an idle tab's
+  stale one. omp shares by the provider and the `credential_pin` account its
+  session bills, and Pi and Kilo by the billing target their session resolves
+  to. A tab whose payer cannot be proven keeps its own row: a Claude tab with
+  no recorded account (an API-key login, or a session whose hook has not run
+  since this update), an omp session without a pin, and every Agy tab, whose
+  statusLine names no account.
+- Under Herdr's own agent order, a shared row only spans adjacent tabs. A tab
+  drawn between two same-account tabs splits them, so each side keeps its own
+  quota and its gap; the header sits on the first drawn tab.
 
 ### Fixed
 

@@ -709,6 +709,15 @@ pub struct ProviderSnapshot {
     /// freshly observed (and vice versa).
     #[serde(default)]
     pub session_quota_observations: BTreeMap<String, Vec<SessionQuotaObservation>>,
+    /// Digest of the Claude account each session was signed in to when its
+    /// statusLine hook last ran, keyed by session id.
+    ///
+    /// The hook reads `oauthAccount.accountUuid` from the `.claude.json` of the
+    /// session's own `CLAUDE_CONFIG_DIR`. Sessions with equal digests are one
+    /// subscription, so they share the newest reading and one sidebar row. A
+    /// session without a digest proves nothing and stays on its own windows.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub session_accounts: BTreeMap<String, String>,
     /// Legacy Claude profile digests retained for cache format compatibility.
     /// Current session-local observations clear this map during migration.
     #[serde(default)]
@@ -739,6 +748,7 @@ impl ProviderSnapshot {
             session_contexts: BTreeMap::new(),
             session_windows: BTreeMap::new(),
             session_quota_observations: BTreeMap::new(),
+            session_accounts: BTreeMap::new(),
             session_quota_scopes: BTreeMap::new(),
             quota_scope_windows: BTreeMap::new(),
             account_id: None,
@@ -804,6 +814,52 @@ impl ProviderSnapshot {
         self.only_observed_session()
     }
 
+    /// The Claude account digest a session's statusLine hook recorded.
+    pub fn account_for_session(&self, session_id: &str) -> Option<&str> {
+        if self.provider != Provider::Claude || !self.session_quota_only {
+            return None;
+        }
+        self.session_accounts.get(session_id).map(String::as_str)
+    }
+
+    /// The session whose quota a pane on `session_id` shows.
+    ///
+    /// A Claude session on a recorded account shows the newest reading of any
+    /// session on that same account: the 5h/7d windows belong to the account,
+    /// and an idle tab would otherwise keep a stale reading while a sibling has
+    /// a fresh one. A tie keeps the pane's own session. A session without an
+    /// account digest keeps its own windows, because nothing proves who pays.
+    fn quota_session_for_lookup<'a>(&'a self, session_id: &'a str) -> Option<&'a str> {
+        let session_id = self.session_for_lookup(session_id)?;
+        let Some(account) = self.account_for_session(session_id) else {
+            return Some(session_id);
+        };
+        let freshness = |id: &str| {
+            self.session_quota_observations
+                .get(id)
+                .into_iter()
+                .flatten()
+                .filter_map(|observation| observation.observed_at_unix)
+                .max()
+        };
+        let own = freshness(session_id);
+        let newest = self
+            .session_accounts
+            .iter()
+            .filter(|(id, digest)| {
+                digest.as_str() == account
+                    && id.as_str() != session_id
+                    && self
+                        .session_windows
+                        .get(id.as_str())
+                        .is_some_and(|windows| !windows.is_empty())
+            })
+            .map(|(id, _)| (freshness(id), id.as_str()))
+            .filter(|(seen, _)| *seen > own)
+            .max();
+        Some(newest.map_or(session_id, |(_, id)| id))
+    }
+
     /// Return the model for a pane's session.
     ///
     /// A known Claude/Codex/Grok session never borrows the provider-level
@@ -867,7 +923,7 @@ impl ProviderSnapshot {
         if self.provider != Provider::Claude || !self.session_quota_only {
             return None;
         }
-        let session_id = session_id.and_then(|id| self.session_for_lookup(id))?;
+        let session_id = session_id.and_then(|id| self.quota_session_for_lookup(id))?;
         self.session_quota_observations
             .get(session_id)?
             .iter()
@@ -883,7 +939,8 @@ impl ProviderSnapshot {
     ///
     /// Lookup order:
     /// 1. Agy with no Herdr session id → latest top-level statusLine windows.
-    /// 2. Session-local snapshot → exact session windows; Agy may bridge an
+    /// 2. Session-local snapshot → exact session windows, or the newest
+    ///    session on the same recorded Claude account; Agy may bridge an
     ///    unmatched subagent id only when exactly one conversation is stored.
     /// 3. Session has a legacy Claude profile scope → canonical scope windows.
     /// 4. Session has legacy `session_windows` → those.
@@ -895,7 +952,8 @@ impl ProviderSnapshot {
             return &self.windows;
         }
         if self.session_quota_only {
-            let Some(session_id) = session_id.and_then(|id| self.session_for_lookup(id)) else {
+            let Some(session_id) = session_id.and_then(|id| self.quota_session_for_lookup(id))
+            else {
                 return &[];
             };
             return self

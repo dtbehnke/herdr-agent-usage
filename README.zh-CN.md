@@ -20,9 +20,10 @@ Provider／模型保持墨白色；进度条上的严重程度色仍表示剩余
 Herdr endpoint 侧栏宽度定长（已计入缩进和滚动条）。空字段自动折叠，百分比可选择
 显示剩余或已用额度。Cache 与 TTL 默认关闭（需要时可在设置里打开）。共用同一份额度的
 标签页在同一个 Space 里都还在 Agent 列表里，只把重复的 5h/7d/30d 收到一行上：
-Grok、Codex、Devin、OpenCode、Cursor、Claude、Muse 按厂商；omp、Pi、Kilo 按会话
-实际计费的账号；Agy 按模型所用的 Gemini 或第三方额度池。尚不知道计费方的标签页
-保留自己的额度行。宽栏下主行只留图标、厂商名和额度，子行无图标，
+Grok、Codex、Devin、OpenCode、Cursor、Muse 按厂商；Claude 按会话所在
+`CLAUDE_CONFIG_DIR` 配置的账号；omp、Pi、Kilo 按会话实际计费的账号。无法确认计费方
+的标签页保留自己的额度行，Agy 标签页也一样。在 Herdr 自带的 agent 排序下，只有相邻的
+标签页才会共用一行。宽栏下主行只留图标、厂商名和额度，子行无图标，
 只显示 model、topic、cx。设置里的 1 行空格仍隔开不同 agent；同一厂商的嵌套子行贴在一起。窄栏仍平铺。
 另一个 Space 里的同厂商仍有自己的额度行。关闭、移动或退出标签页后，剩下的标签页会立即重新分组。Agent
 order 默认按 Space 分组，组内剩余额度最少的优先。

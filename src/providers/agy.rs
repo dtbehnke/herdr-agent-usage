@@ -68,13 +68,6 @@ fn active_pool(model: Option<&str>) -> Option<Pool> {
     }
 }
 
-pub(crate) fn pool_name(model: &str) -> Option<&'static str> {
-    active_pool(Some(model)).map(|pool| match pool {
-        Pool::Gemini => "gemini",
-        Pool::ThirdParty => "3p",
-    })
-}
-
 /// Parse the quota object emitted by Agy/Antigravity's statusLine JSON.
 ///
 /// Agy reports separate Gemini and third-party (Claude/GPT) pools. When the

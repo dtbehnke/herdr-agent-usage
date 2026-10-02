@@ -4,7 +4,8 @@ use crate::herdr::{
     current_focused_pane, find_agent_icon_panes, find_agent_pane, focused_pane_in_snapshot,
     list_agent_panes, list_agent_state, plugin_quota_present, publish_icon_tokens,
     publish_pane_tokens, publish_pane_tokens_with_scrolled_icons, publish_status_icons,
-    refresh_pane_topic, AgentPane, AgentStatus, PaneQuotaUpdate, PaneTokens,
+    refresh_pane_topic, AgentPane, AgentStatus, PaneQuotaUpdate, PaneTokens, PanelOrder,
+    PayerEvidence, QuotaGroups,
 };
 use crate::model::{
     BillingTarget, CredentialScope, Harness, Provider, ProviderSnapshot, Resolution,
@@ -542,11 +543,12 @@ pub fn layout() -> Result<()> {
 
 fn relayout(seed: Option<String>) -> Result<()> {
     let enabled = AgentSelection::from_args_or_env(&[]);
+    // Grouping reads the whole inventory: a pane of a harness this plugin
+    // does not publish is still drawn between two others and splits them.
     let mut panes = list_agent_panes()?;
-    panes.retain(|pane| enabled.contains(&pane.harness));
-    let mut stale = stale_layout_workspaces(&panes);
+    let mut stale = stale_layout_workspaces(&panes, crate::herdr::panel_order());
     stale.extend(seed);
-    panes.retain(|pane| stale.contains(&pane.workspace_id));
+    panes.retain(|pane| enabled.contains(&pane.harness) && stale.contains(&pane.workspace_id));
     if panes.is_empty() {
         return Ok(());
     }
@@ -554,7 +556,8 @@ fn relayout(seed: Option<String>) -> Result<()> {
     publish_resolved(&cache, &mut panes, None, false, false)
 }
 
-fn stale_layout_workspaces(panes: &[AgentPane]) -> BTreeSet<String> {
+fn stale_layout_workspaces(panes: &[AgentPane], order: PanelOrder) -> BTreeSet<String> {
+    let groups = QuotaGroups::new(panes, order, &PayerEvidence::from_cache());
     let mut headers = BTreeMap::<&str, usize>::new();
     for pane in panes {
         if pane
@@ -568,12 +571,13 @@ fn stale_layout_workspaces(panes: &[AgentPane]) -> BTreeSet<String> {
     panes
         .iter()
         .filter(|pane| {
-            let misnested = crate::herdr::shares_login_quota(pane)
-                && pane_needs_vendor_restyle(
-                    pane,
-                    panes,
-                    representative_pane_id(pane, panes) == pane.pane_id,
-                );
+            let misnested = match groups.head(&pane.pane_id) {
+                Some(head) => pane_needs_vendor_restyle(pane, &groups, head == pane.pane_id),
+                // A pane that shares no row, such as a Claude tab whose
+                // sibling turned out to be another login, must not keep a
+                // head's or a child's styling.
+                None => pane_keeps_nested_styling(pane),
+            };
             let misheaded = !pane.workspace_id.is_empty()
                 && plugin_quota_present(&pane.tokens)
                 && headers.get(pane.workspace_id.as_str()) != Some(&1);
@@ -1649,8 +1653,9 @@ fn panes_for_vendor_rows(live: &[AgentPane]) -> Vec<AgentPane> {
 /// one Grok would otherwise leave a sibling showing duplicate 5h/7d/30d.
 fn sync_vendor_row_siblings(tokens: &mut Vec<PaneTokens>, panes: &mut Vec<AgentPane>) {
     let inventory = panes_for_vendor_rows(panes);
-    mark_one_quota_row_per_vendor(tokens, &inventory);
-    for extra in vendor_row_sync_extras(tokens, &inventory) {
+    let order = crate::herdr::panel_order();
+    mark_one_quota_row_per_vendor(tokens, &inventory, order);
+    for extra in vendor_row_sync_extras(tokens, &inventory, order) {
         if let Some(pane) = inventory
             .iter()
             .find(|pane| pane.pane_id == extra.pane_id)
@@ -1662,31 +1667,31 @@ fn sync_vendor_row_siblings(tokens: &mut Vec<PaneTokens>, panes: &mut Vec<AgentP
     }
 }
 
-fn vendor_row_sync_extras(tokens: &[PaneTokens], inventory: &[AgentPane]) -> Vec<PaneTokens> {
+fn vendor_row_sync_extras(
+    tokens: &[PaneTokens],
+    inventory: &[AgentPane],
+    order: PanelOrder,
+) -> Vec<PaneTokens> {
+    let groups = QuotaGroups::new(inventory, order, &PayerEvidence::from_cache());
     let published = tokens
         .iter()
         .map(|token| token.pane_id.as_str())
         .collect::<BTreeSet<_>>();
     let live_groups = tokens
         .iter()
-        .filter_map(|token| {
-            inventory
-                .iter()
-                .find(|pane| pane.pane_id == token.pane_id)
-                .filter(|pane| crate::herdr::shares_login_quota(pane))
-                .map(crate::herdr::nest_group_key)
-        })
+        .filter_map(|token| groups.key(&token.pane_id))
         .collect::<BTreeSet<_>>();
     inventory
         .iter()
         .filter(|pane| {
             !published.contains(pane.pane_id.as_str())
-                && crate::herdr::shares_login_quota(pane)
-                && live_groups.contains(&crate::herdr::nest_group_key(pane))
+                && groups
+                    .key(&pane.pane_id)
+                    .is_some_and(|key| live_groups.contains(key))
         })
         .filter_map(|pane| {
-            let should_show = representative_pane_id(pane, inventory) == pane.pane_id;
-            pane_needs_vendor_restyle(pane, inventory, should_show).then(|| PaneTokens {
+            let should_show = groups.head(&pane.pane_id) == Some(pane.pane_id.as_str());
+            pane_needs_vendor_restyle(pane, &groups, should_show).then(|| PaneTokens {
                 pane_id: pane.pane_id.clone(),
                 quota: PaneQuotaUpdate::Preserve,
                 identity: None,
@@ -1697,18 +1702,19 @@ fn vendor_row_sync_extras(tokens: &[PaneTokens], inventory: &[AgentPane]) -> Vec
         .collect()
 }
 
-/// Keep account quota on one pane per login-scoped vendor *in each Space*.
-/// Two Grok tabs in the same project collapse; a Grok in another Space stays.
-fn mark_one_quota_row_per_vendor(tokens: &mut [PaneTokens], panes: &[AgentPane]) {
+/// Keep account quota on one pane per payer *in each Space*. Two Grok tabs
+/// in the same project collapse; a Grok in another Space stays.
+fn mark_one_quota_row_per_vendor(
+    tokens: &mut [PaneTokens],
+    panes: &[AgentPane],
+    order: PanelOrder,
+) {
+    let groups = QuotaGroups::new(panes, order, &PayerEvidence::from_cache());
     for token in tokens.iter_mut() {
-        let Some(pane) = panes.iter().find(|pane| pane.pane_id == token.pane_id) else {
-            continue;
-        };
-        if !crate::herdr::shares_login_quota(pane) {
-            continue;
-        }
-        let representative = representative_pane_id(pane, panes);
-        if token.pane_id != representative {
+        if groups
+            .head(&token.pane_id)
+            .is_some_and(|head| head != token.pane_id)
+        {
             token.show_account_quota = false;
         }
     }
@@ -1742,45 +1748,29 @@ fn pane_has_brand_identity(pane: &AgentPane) -> bool {
     })
 }
 
-fn group_is_nested(pane: &AgentPane, inventory: &[AgentPane]) -> bool {
-    let key = crate::herdr::nest_group_key(pane);
-    inventory
-        .iter()
-        .filter(|candidate| crate::herdr::nest_group_key(candidate) == key)
-        .count()
-        >= 2
-}
-
 /// True when this unpublished sibling's tokens would render the wrong vendor
 /// role. A second Cursor in a Space must restyle the existing Flat
 /// representative into a nested head even if it already has 5h/7d/30d.
-fn pane_needs_vendor_restyle(pane: &AgentPane, inventory: &[AgentPane], should_show: bool) -> bool {
+fn pane_needs_vendor_restyle(pane: &AgentPane, groups: &QuotaGroups, should_show: bool) -> bool {
     let has_windows = pane_has_account_windows(pane);
     if should_show != has_windows {
         return true;
     }
-    let nested = group_is_nested(pane, inventory);
+    let nested = groups.is_nested(&pane.pane_id);
     if nested && should_show && !pane_has_share_windows(pane) {
         return true;
     }
     if nested && !should_show && pane_has_brand_identity(pane) {
         return true;
     }
-    if !nested && (pane_has_share_windows(pane) || !pane_has_brand_identity(pane)) {
-        return plugin_quota_present(&pane.tokens);
-    }
-    false
+    !nested && pane_keeps_nested_styling(pane)
 }
 
-fn representative_pane_id(current: &AgentPane, panes: &[AgentPane]) -> String {
-    let key = crate::herdr::nest_group_key(current);
-    panes
-        .iter()
-        .filter(|pane| crate::herdr::nest_group_key(pane) == key)
-        .map(|pane| pane.pane_id.as_str())
-        .min()
-        .unwrap_or(current.pane_id.as_str())
-        .to_string()
+/// A flat pane still styled as a nested head (shared windows) or child (no
+/// brand line).
+fn pane_keeps_nested_styling(pane: &AgentPane) -> bool {
+    (pane_has_share_windows(pane) || !pane_has_brand_identity(pane))
+        && plugin_quota_present(&pane.tokens)
 }
 
 /// The lowest headroom each provider is showing in this pass.
@@ -3048,7 +3038,7 @@ mod tests {
             test_pane("w1:p3", Harness::Claude),
         ];
         panes[1].focused = true;
-        mark_one_quota_row_per_vendor(&mut tokens, &panes);
+        mark_one_quota_row_per_vendor(&mut tokens, &panes, PanelOrder::Quota);
         assert!(tokens[0].show_account_quota);
         assert!(!tokens[1].show_account_quota);
         assert!(tokens[2].show_account_quota);
@@ -3066,7 +3056,7 @@ mod tests {
         ];
         panes[1].status = AgentStatus::Working;
         panes[1].focused = true;
-        mark_one_quota_row_per_vendor(&mut tokens, &panes);
+        mark_one_quota_row_per_vendor(&mut tokens, &panes, PanelOrder::Quota);
         assert!(tokens[0].show_account_quota);
         assert!(!tokens[1].show_account_quota);
     }
@@ -3075,12 +3065,12 @@ mod tests {
     fn a_lone_vendor_pane_keeps_its_quota_row() {
         let mut tokens = vec![quota_tokens("w1:p1", "Grok", Some(87))];
         let panes = vec![test_pane("w1:p1", Harness::Grok)];
-        mark_one_quota_row_per_vendor(&mut tokens, &panes);
+        mark_one_quota_row_per_vendor(&mut tokens, &panes, PanelOrder::Quota);
         assert!(tokens[0].show_account_quota);
     }
 
     #[test]
-    fn claude_panes_in_one_space_share_one_quota_row() {
+    fn claude_panes_without_a_recorded_account_keep_their_own_quota_rows() {
         let mut tokens = vec![
             quota_tokens("w1:p1", "Claude", Some(40)),
             quota_tokens("w1:p2", "Claude", Some(12)),
@@ -3089,7 +3079,29 @@ mod tests {
             test_pane("w1:p1", Harness::Claude),
             test_pane("w1:p2", Harness::Claude),
         ];
-        mark_one_quota_row_per_vendor(&mut tokens, &panes);
+        mark_one_quota_row_per_vendor(&mut tokens, &panes, PanelOrder::Quota);
+        assert!(tokens[0].show_account_quota);
+        assert!(tokens[1].show_account_quota);
+    }
+
+    /// Under Herdr's own order a pane drawn between two Grok tabs splits
+    /// them, so each keeps its quota rather than pointing at a row that is
+    /// drawn somewhere else.
+    #[test]
+    fn panes_split_by_herdrs_own_order_each_keep_their_quota_row() {
+        let mut tokens = vec![
+            quota_tokens("w1:p1", "Grok", Some(87)),
+            quota_tokens("w1:p3", "Grok", Some(87)),
+        ];
+        let panes = vec![
+            test_pane("w1:p1", Harness::Grok),
+            test_pane("w1:p2", Harness::Muse),
+            test_pane("w1:p3", Harness::Grok),
+        ];
+        mark_one_quota_row_per_vendor(&mut tokens, &panes, PanelOrder::Layout);
+        assert!(tokens[0].show_account_quota);
+        assert!(tokens[1].show_account_quota);
+        mark_one_quota_row_per_vendor(&mut tokens, &panes, PanelOrder::Quota);
         assert!(tokens[0].show_account_quota);
         assert!(!tokens[1].show_account_quota);
     }
@@ -3107,7 +3119,7 @@ mod tests {
             test_pane("w1:p2", Harness::OpenCode),
         ];
         panes[1].focused = true;
-        mark_one_quota_row_per_vendor(&mut tokens, &panes);
+        mark_one_quota_row_per_vendor(&mut tokens, &panes, PanelOrder::Quota);
         assert!(tokens[0].show_account_quota);
         assert!(!tokens[1].show_account_quota);
     }
@@ -3122,7 +3134,7 @@ mod tests {
         ];
         let mut panes = vec![test_pane("w1:p1", Harness::Grok), other];
         panes[0].focused = true;
-        mark_one_quota_row_per_vendor(&mut tokens, &panes);
+        mark_one_quota_row_per_vendor(&mut tokens, &panes, PanelOrder::Quota);
         assert!(tokens[0].show_account_quota);
         assert!(tokens[1].show_account_quota);
     }
@@ -3138,7 +3150,7 @@ mod tests {
             .tokens
             .insert("quota_week_inline_normal".to_string(), "7d 54%".to_string());
         let tokens = vec![quota_tokens("w5:pA", "Grok", Some(54))];
-        let extras = vendor_row_sync_extras(&tokens, &[focused, extra]);
+        let extras = vendor_row_sync_extras(&tokens, &[focused, extra], PanelOrder::Quota);
         assert_eq!(extras.len(), 1, "{extras:?}");
         assert_eq!(extras[0].pane_id, "w5:pD");
         assert!(!extras[0].show_account_quota);
@@ -3159,7 +3171,7 @@ mod tests {
         let mut child = test_pane("w9:p7", Harness::Cursor);
         child.workspace_id = "w9".to_string();
         let tokens = vec![quota_tokens("w9:p7", "Cursor", Some(0))];
-        let extras = vendor_row_sync_extras(&tokens, &[head, child]);
+        let extras = vendor_row_sync_extras(&tokens, &[head, child], PanelOrder::Quota);
         assert_eq!(extras.len(), 1, "{extras:?}");
         assert_eq!(extras[0].pane_id, "w9:p1");
         assert!(extras[0].show_account_quota);
@@ -3177,7 +3189,7 @@ mod tests {
         child.workspace_id = "w5".to_string();
         child.focused = true;
         let tokens = vec![quota_tokens("w5:pD", "Grok", Some(54))];
-        let extras = vendor_row_sync_extras(&tokens, &[head, child]);
+        let extras = vendor_row_sync_extras(&tokens, &[head, child], PanelOrder::Quota);
         assert!(
             extras.iter().all(|extra| extra.pane_id != "w5:pA"),
             "share tokens already count as account windows: {extras:?}"
@@ -3206,34 +3218,27 @@ mod tests {
         ("quota_5h_normal", "5h 77%"),
     ];
 
+    const NESTED_HEAD: [(&str, &str); 4] = [
+        ("quota_group", "~"),
+        ("quota_icon", "x"),
+        ("quota_provider", "Grok"),
+        ("quota_share_5h_normal", "5h 77%"),
+    ];
+
     #[test]
     fn a_nested_head_left_alone_marks_its_space_for_layout() {
-        let survivor = published_pane(
-            "w1:p1",
-            "w1",
-            Harness::Claude,
-            &[
-                ("quota_group", "~"),
-                ("quota_icon", "x"),
-                ("quota_provider", "Claude"),
-                ("quota_share_5h_normal", "5h 77%"),
-            ],
-        );
+        let survivor = published_pane("w1:p1", "w1", Harness::Grok, &NESTED_HEAD);
         let elsewhere = published_pane("w2:p1", "w2", Harness::Claude, &FLAT_CLAUDE);
         assert_eq!(
-            stale_layout_workspaces(&[survivor, elsewhere]),
+            stale_layout_workspaces(&[survivor, elsewhere], PanelOrder::Quota),
             BTreeSet::from(["w1".to_string()])
         );
     }
 
+    /// Two Claude tabs nested before their accounts were told apart: neither
+    /// shares a row now, so the old head styling must be repaired.
     #[test]
-    fn a_steady_flat_pane_needs_no_layout_pass() {
-        let pane = published_pane("w1:p1", "w1", Harness::Claude, &FLAT_CLAUDE);
-        assert!(stale_layout_workspaces(&[pane]).is_empty());
-    }
-
-    #[test]
-    fn a_steady_nested_pair_needs_no_layout_pass() {
+    fn a_nested_head_whose_payer_is_unknown_marks_its_space_for_layout() {
         let head = published_pane(
             "w1:p1",
             "w1",
@@ -3249,9 +3254,40 @@ mod tests {
             "w1:p2",
             "w1",
             Harness::Claude,
-            &[("quota_model", "Opus 5.5")],
+            &[("quota_model", "Opus 5.5"), ("quota_5h_normal", "5h 40%")],
         );
-        assert!(stale_layout_workspaces(&[head, child]).is_empty());
+        assert_eq!(
+            stale_layout_workspaces(&[head, child], PanelOrder::Quota),
+            BTreeSet::from(["w1".to_string()])
+        );
+    }
+
+    #[test]
+    fn a_steady_flat_pane_needs_no_layout_pass() {
+        let pane = published_pane("w1:p1", "w1", Harness::Claude, &FLAT_CLAUDE);
+        assert!(stale_layout_workspaces(&[pane], PanelOrder::Quota).is_empty());
+    }
+
+    #[test]
+    fn a_steady_nested_pair_needs_no_layout_pass() {
+        let head = published_pane("w1:p1", "w1", Harness::Grok, &NESTED_HEAD);
+        let child = published_pane("w1:p2", "w1", Harness::Grok, &[("quota_model", "grok-4")]);
+        assert!(stale_layout_workspaces(&[head, child], PanelOrder::Quota).is_empty());
+    }
+
+    /// Herdr's own order drew a third pane between the pair, so it is no
+    /// longer one group.
+    #[test]
+    fn a_nested_pair_split_by_herdrs_own_order_needs_a_layout_pass() {
+        let head = published_pane("w1:p1", "w1", Harness::Grok, &NESTED_HEAD);
+        let between = published_pane("w1:p2", "w1", Harness::Claude, &FLAT_CLAUDE[1..]);
+        let child = published_pane("w1:p3", "w1", Harness::Grok, &[("quota_model", "grok-4")]);
+        let panes = [head, between, child];
+        assert!(stale_layout_workspaces(&panes, PanelOrder::Quota).is_empty());
+        assert_eq!(
+            stale_layout_workspaces(&panes, PanelOrder::Layout),
+            BTreeSet::from(["w1".to_string()])
+        );
     }
 
     #[test]
@@ -3263,7 +3299,7 @@ mod tests {
             &[("quota_icon", "x"), ("quota_provider_model", "Codex/gpt-5")],
         );
         assert_eq!(
-            stale_layout_workspaces(&[survivor]),
+            stale_layout_workspaces(&[survivor], PanelOrder::Quota),
             BTreeSet::from(["w3".to_string()])
         );
     }
@@ -3282,7 +3318,7 @@ mod tests {
             ],
         );
         assert_eq!(
-            stale_layout_workspaces(&[resident, moved]),
+            stale_layout_workspaces(&[resident, moved], PanelOrder::Quota),
             BTreeSet::from(["w1".to_string()])
         );
     }
@@ -3333,7 +3369,7 @@ mod tests {
     #[test]
     fn a_pane_the_plugin_never_published_needs_no_layout_pass() {
         let pane = published_pane("w4:p1", "w4", Harness::Pi, &[]);
-        assert!(stale_layout_workspaces(&[pane]).is_empty());
+        assert!(stale_layout_workspaces(&[pane], PanelOrder::Quota).is_empty());
     }
 
     #[test]
@@ -3348,7 +3384,7 @@ mod tests {
         let mut codex = test_pane("w5:pB", Harness::Codex);
         codex.workspace_id = "w5".to_string();
         let tokens = vec![quota_tokens("w5:pA", "Grok", Some(54))];
-        let extras = vendor_row_sync_extras(&tokens, &[grok, extra_grok, codex]);
+        let extras = vendor_row_sync_extras(&tokens, &[grok, extra_grok, codex], PanelOrder::Quota);
         assert_eq!(extras.len(), 1, "{extras:?}");
         assert_eq!(extras[0].pane_id, "w5:pD");
     }

@@ -387,6 +387,7 @@ impl CacheStore {
             api_generation,
         );
         merge_session_windows(&mut snapshot, previous_snapshot, session_id, quota_scope);
+        merge_session_accounts(&mut snapshot, previous_snapshot);
         let current_session_ids = session_id
             .map(|session_id| vec![session_id.to_string()])
             .unwrap_or_default();
@@ -482,6 +483,7 @@ impl CacheStore {
             }
         }
         merge_session_windows(&mut snapshot, previous.as_ref(), session_id, None);
+        merge_session_accounts(&mut snapshot, previous.as_ref());
         let current_session_ids = session_id
             .map(|session_id| vec![session_id.to_string()])
             .unwrap_or_default();
@@ -1373,8 +1375,27 @@ fn previous_windows_for_merge<'a>(
         })
 }
 
+/// Keep the account every retained session recorded. This observation's own
+/// entry wins; a tick that could not read the account keeps the session's
+/// earlier one rather than dropping it out of its row.
+fn merge_session_accounts(snapshot: &mut ProviderSnapshot, previous: Option<&ProviderSnapshot>) {
+    if !snapshot.session_quota_only {
+        return;
+    }
+    let Some(previous) = previous.filter(|previous| previous.session_quota_only) else {
+        return;
+    };
+    for (session_id, account) in &previous.session_accounts {
+        snapshot
+            .session_accounts
+            .entry(session_id.clone())
+            .or_insert_with(|| account.clone());
+    }
+}
+
 fn prune_session_diagnostics(snapshot: &mut ProviderSnapshot, current_session_ids: &[String]) {
     prune_session_map(&mut snapshot.session_models, current_session_ids);
+    prune_session_map(&mut snapshot.session_accounts, current_session_ids);
     prune_session_map(&mut snapshot.session_contexts, current_session_ids);
     prune_session_map(&mut snapshot.session_windows, current_session_ids);
     prune_session_map(
@@ -1408,7 +1429,7 @@ fn prune_session_map<T>(map: &mut BTreeMap<String, T>, current_session_ids: &[St
     }
 }
 
-fn statusline_session_id(observation: &Value) -> Option<&str> {
+pub(crate) fn statusline_session_id(observation: &Value) -> Option<&str> {
     observation
         .get("session_id")
         .or_else(|| observation.get("sessionId"))
@@ -2235,6 +2256,51 @@ mod tests {
             .windows_for_session(Some("personal"))
             .iter()
             .all(|window| window.kind != WindowKind::FiveHour));
+    }
+
+    /// Each session keeps the account its own hook recorded, through later
+    /// ticks of other sessions, a tick that could not read the account, and
+    /// the copy refresh saves from the mailbox.
+    #[test]
+    fn claude_sessions_keep_the_account_their_hook_recorded() {
+        let directory = tempdir().unwrap();
+        let cache = CacheStore::new(directory.path());
+        let observe = |session: &str, account: Option<&str>, at: u64| {
+            let mut snapshot =
+                ProviderSnapshot::new(Provider::Claude, vec![five_hour(5.0, 16_000)], at)
+                    .session_local();
+            if let Some(account) = account {
+                snapshot
+                    .session_accounts
+                    .insert(session.to_string(), account.to_string());
+            }
+            cache
+                .save_statusline_observation_with_api_generation(
+                    Provider::Claude,
+                    snapshot,
+                    &json!({ "session_id": session }),
+                    None,
+                )
+                .unwrap();
+        };
+        observe("session-a", Some("claude:a"), 100);
+        observe("session-b", Some("claude:b"), 110);
+        observe("session-a", None, 120);
+
+        let saved = cache
+            .load_statusline_observation(Provider::Claude)
+            .unwrap()
+            .unwrap()
+            .snapshot;
+        assert_eq!(saved.account_for_session("session-a"), Some("claude:a"));
+        assert_eq!(saved.account_for_session("session-b"), Some("claude:b"));
+
+        cache
+            .save_preserving_context_for_session(saved, Some("session-a"))
+            .unwrap();
+        let refreshed = cache.load(Provider::Claude).unwrap().unwrap();
+        assert_eq!(refreshed.account_for_session("session-a"), Some("claude:a"));
+        assert_eq!(refreshed.account_for_session("session-b"), Some("claude:b"));
     }
 
     #[test]

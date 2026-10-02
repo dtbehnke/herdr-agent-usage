@@ -27,9 +27,10 @@ Empty fields collapse; percentages can show remaining or used quota. Cache and
 TTL are off by default (turn them on in settings if you want them). Tabs that
 draw on the same quota keep every tab visible in the Agent panel; duplicate
 5h/7d/30d rows collapse to one pane per Space. Grok, Codex, Devin, OpenCode,
-Cursor, Claude, and Muse share by vendor; omp, Pi, and Kilo by the account
-their session bills; Agy by the Gemini or third-party pool its model draws
-from. A tab whose payer is not known yet keeps its own row. On a
+Cursor, and Muse share by vendor; Claude by the account of the session's
+`CLAUDE_CONFIG_DIR` profile; omp, Pi, and Kilo by the account their session
+bills. A tab whose payer cannot be proven keeps its own row, and so does every
+Agy tab. Under Herdr's own agent order only adjacent tabs share a row. On a
 wide sidebar, the vendor icon and name sit above that pane's quota, and extra
 tabs list model, topic, and context with no icon. A settings row gap of 1 still
 separates different agents; nested extra tabs of the same vendor stay flush.
