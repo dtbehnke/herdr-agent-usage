@@ -2,7 +2,10 @@ use crate::cache::CacheStore;
 use crate::model::{ContextUsage, Provider, ProviderSnapshot, ResetAt, UsageWindow, WindowKind};
 use crate::providers::statusline::{parse_context, parse_model};
 use crate::providers::ProviderError;
+use serde::Deserialize;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
+use std::path::Path;
 
 pub fn parse_statusline(
     value: &Value,
@@ -137,6 +140,51 @@ fn parse_expires_at(value: &Value) -> Option<u64> {
                 .and_then(ResetAt::parse)
                 .map(ResetAt::unix_seconds)
         })
+}
+
+/// Digest of the Claude account the statusLine hook runs under.
+///
+/// Claude Code keeps the signed-in account in `.claude.json` inside
+/// `CLAUDE_CONFIG_DIR`, or in `~/.claude.json` without one. The hook inherits
+/// the session's environment, so this names the account of that session's
+/// profile. Only `oauthAccount.accountUuid` and `organizationUuid` are kept:
+/// one person in a personal plan and in a Team organization has two sets of
+/// limits. The rest of the file, MCP server configuration included, is
+/// skipped by the parser and never stored. An API-key login has no
+/// `oauthAccount` and yields `None`.
+pub fn account_digest(config_dir: Option<&Path>, home: Option<&Path>) -> Option<String> {
+    #[derive(Deserialize)]
+    struct Config {
+        #[serde(rename = "oauthAccount")]
+        oauth_account: Option<Account>,
+    }
+    #[derive(Deserialize)]
+    struct Account {
+        #[serde(rename = "accountUuid")]
+        account_uuid: Option<String>,
+        #[serde(rename = "organizationUuid")]
+        organization_uuid: Option<String>,
+    }
+
+    let path = match config_dir.filter(|dir| !dir.as_os_str().is_empty()) {
+        Some(dir) => dir.join(".claude.json"),
+        None => home?.join(".claude.json"),
+    };
+    let file = std::fs::File::open(path).ok()?;
+    let config: Config = serde_json::from_reader(std::io::BufReader::new(file)).ok()?;
+    let account = config.oauth_account?;
+    let uuid = account.account_uuid?;
+    let uuid = uuid.trim();
+    if uuid.is_empty() {
+        return None;
+    }
+    let organization = account.organization_uuid.unwrap_or_default();
+    let digest = Sha256::new()
+        .chain_update(uuid.as_bytes())
+        .chain_update([0])
+        .chain_update(organization.trim().as_bytes())
+        .finalize();
+    Some(format!("claude:{digest:x}"))
 }
 
 pub fn run_statusline(input: &[u8]) -> std::result::Result<ProviderSnapshot, ProviderError> {
@@ -328,5 +376,71 @@ mod tests {
     #[test]
     fn rejects_non_json_statusline_input() {
         assert!(run_statusline(b"not-json").is_err());
+    }
+
+    /// Two `CLAUDE_CONFIG_DIR` profiles signed in to two accounts, and the
+    /// default profile in `~/.claude.json`.
+    #[test]
+    fn the_account_digest_follows_the_profile_the_hook_runs_in() {
+        let home = tempfile::tempdir().unwrap();
+        let first = home.path().join("first");
+        let second = home.path().join("second");
+        let team = home.path().join("team");
+        let same = home.path().join("same");
+        for (dir, uuid, organization) in [
+            (home.path(), "uuid-default", "org-personal"),
+            (first.as_path(), "uuid-a", "org-personal"),
+            (second.as_path(), "uuid-b", "org-personal"),
+            (team.as_path(), "uuid-a", "org-team"),
+            (same.as_path(), "uuid-a", "org-personal"),
+        ] {
+            std::fs::create_dir_all(dir).unwrap();
+            std::fs::write(
+                dir.join(".claude.json"),
+                json!({
+                    "oauthAccount": {
+                        "accountUuid": uuid,
+                        "organizationUuid": organization,
+                        "emailAddress": "user@example.com"
+                    },
+                    "mcpServers": {"x": {"env": {"TOKEN": "secret"}}}
+                })
+                .to_string(),
+            )
+            .unwrap();
+        }
+
+        let default = account_digest(None, Some(home.path())).unwrap();
+        let a = account_digest(Some(&first), Some(home.path())).unwrap();
+        let b = account_digest(Some(&second), Some(home.path())).unwrap();
+        assert_ne!(a, b);
+        assert_ne!(a, default);
+        // One person in a personal plan and in a Team organization.
+        assert_ne!(account_digest(Some(&team), None), Some(a.clone()));
+        // Two profiles signed in to the same login share it.
+        assert_eq!(account_digest(Some(&same), None), Some(a.clone()));
+        assert_eq!(account_digest(Some(&first), None), Some(a.clone()));
+        assert!(!a.contains("uuid-a"), "the raw account id is not stored");
+        // An empty CLAUDE_CONFIG_DIR is the same as none.
+        assert_eq!(
+            account_digest(Some(Path::new("")), Some(home.path())),
+            Some(default)
+        );
+    }
+
+    #[test]
+    fn an_api_key_or_unreadable_profile_has_no_account() {
+        let home = tempfile::tempdir().unwrap();
+        assert_eq!(account_digest(None, Some(home.path())), None);
+        std::fs::write(home.path().join(".claude.json"), r#"{"primaryApiKey":"k"}"#).unwrap();
+        assert_eq!(account_digest(None, Some(home.path())), None);
+        std::fs::write(home.path().join(".claude.json"), "{not json").unwrap();
+        assert_eq!(account_digest(None, Some(home.path())), None);
+        std::fs::write(
+            home.path().join(".claude.json"),
+            r#"{"oauthAccount":{"accountUuid":"  "}}"#,
+        )
+        .unwrap();
+        assert_eq!(account_digest(None, Some(home.path())), None);
     }
 }

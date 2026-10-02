@@ -39,6 +39,7 @@ fn main() -> Result<()> {
         Command::Startup { provider } => herdr_agent_quota::refresh::startup(&provider.providers()),
         Command::Event => herdr_agent_quota::refresh::event(),
         Command::Focus => herdr_agent_quota::refresh::focus(),
+        Command::Layout => herdr_agent_quota::refresh::layout(),
         Command::Dashboard => herdr_agent_quota::dashboard::run(),
         Command::Settings => herdr_agent_quota::settings::run(),
         Command::Configure {

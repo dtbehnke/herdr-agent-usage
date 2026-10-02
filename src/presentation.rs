@@ -1021,6 +1021,74 @@ mod tests {
         assert_eq!(fresh.quota_headroom, Some(8));
     }
 
+    fn claude_session(
+        snapshot: &mut ProviderSnapshot,
+        session: &str,
+        used: f64,
+        observed_at: u64,
+        account: Option<&str>,
+    ) {
+        snapshot.session_windows.insert(
+            session.to_string(),
+            vec![window(WindowKind::FiveHour, used, 14_820)],
+        );
+        snapshot.session_quota_observations.insert(
+            session.to_string(),
+            vec![SessionQuotaObservation {
+                kind: WindowKind::FiveHour,
+                observed_at_unix: Some(observed_at),
+                api_generation: None,
+            }],
+        );
+        if let Some(account) = account {
+            snapshot
+                .session_accounts
+                .insert(session.to_string(), account.to_string());
+        }
+    }
+
+    fn five_hour_at(snapshot: &ProviderSnapshot, now: u64, session: &str) -> String {
+        MetadataTokens::from_snapshot_for_pane(
+            snapshot,
+            now,
+            Some(session),
+            PercentStyle::Remaining,
+            SidebarShape::default(),
+        )
+        .quota_5h
+    }
+
+    /// The tab that carries a shared row may be the idle one. On a proven
+    /// shared account it shows the sibling's fresh reading, not its own
+    /// five-minute-old one.
+    #[test]
+    fn claude_sessions_on_one_account_show_the_newest_reading() {
+        let mut snapshot = ProviderSnapshot::new(Provider::Claude, vec![], 100).session_local();
+        claude_session(&mut snapshot, "idle", 10.0, 100, Some("claude:a"));
+        claude_session(&mut snapshot, "busy", 40.0, 390, Some("claude:a"));
+        claude_session(&mut snapshot, "other-login", 90.0, 399, Some("claude:b"));
+        claude_session(&mut snapshot, "unstamped", 70.0, 100, None);
+
+        assert_eq!(five_hour_at(&snapshot, 400, "idle"), "5h 60% 4h00m");
+        assert_eq!(five_hour_at(&snapshot, 400, "busy"), "5h 60% 4h00m");
+        // A newer reading from another login is never borrowed.
+        assert_eq!(five_hour_at(&snapshot, 400, "other-login"), "5h 10% 4h00m");
+        // Nothing proves who pays for this one, so it keeps its own age.
+        assert_eq!(five_hour_at(&snapshot, 400, "unstamped"), "5h stale 5m");
+    }
+
+    /// When every tab on the account is old, the newest reading still wins
+    /// and says how old it is.
+    #[test]
+    fn claude_sessions_on_one_stale_account_show_the_newest_stale_reading() {
+        let mut snapshot = ProviderSnapshot::new(Provider::Claude, vec![], 100).session_local();
+        claude_session(&mut snapshot, "older", 10.0, 100, Some("claude:a"));
+        claude_session(&mut snapshot, "newer", 40.0, 280, Some("claude:a"));
+
+        assert_eq!(five_hour_at(&snapshot, 460, "older"), "5h stale 3m");
+        assert_eq!(five_hour_at(&snapshot, 460, "newer"), "5h stale 3m");
+    }
+
     #[test]
     fn a_hidden_stale_claude_window_does_not_suppress_visible_fresh_headroom() {
         let mut snapshot = ProviderSnapshot::new(Provider::Claude, vec![], 100).session_local();

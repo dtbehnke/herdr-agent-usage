@@ -134,6 +134,17 @@ than a wrong number.
 - Claude/Agy StatusLine has no reliable serving-account ID. New observations
   carry `session_quota_only`; they never share windows by profile directory.
   Rebuild old mailboxes from their raw payload, not merged profile windows.
+- The Claude statusLine hook stamps `session_accounts` with
+  `sha256(accountUuid\0organizationUuid)` from `oauthAccount` in the
+  `.claude.json` of its own `CLAUDE_CONFIG_DIR` (else `~/.claude.json`). Only
+  those fields are deserialized; the file also holds MCP `env` values.
+  Sessions with one stamp are one account: they share a sidebar row and show
+  the newest reading among them. No stamp means no sharing. Agy has no stamp
+  and never shares a row.
+- Sidebar row sharing goes through `herdr::QuotaGroups`, built from Herdr's
+  inventory order. Under Herdr's own agent order only a run of adjacent panes
+  is one group, and its first pane is the head. Do not derive group
+  membership from `nest_group_key` alone.
 - Agy must identify the active pool or receive only one possible pool. Do not
   combine Gemini and third-party quotas for an unknown model.
 - OMP stores all accounts in one sanitized provider report so a second pin

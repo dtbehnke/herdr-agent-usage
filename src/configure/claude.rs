@@ -1,8 +1,8 @@
 use super::statusline::Adapter;
 use crate::cache::{CacheStore, DEFAULT_WATCH_INTERVAL_SECONDS};
-use crate::model::Provider;
+use crate::model::{Provider, ProviderSnapshot};
 use crate::presentation::pace_segment;
-use crate::providers::claude::parse_statusline;
+use crate::providers::claude::{account_digest, parse_statusline};
 use crate::providers::statusline::api_generation;
 use anyhow::{Context, Result};
 use serde_json::Value;
@@ -84,10 +84,11 @@ pub fn run_statusline_hook() -> Result<()> {
     let mut pace = None;
     if let Ok(value) = serde_json::from_slice::<Value>(&input) {
         let now_unix = CacheStore::now_unix();
-        if let Ok(snapshot) = parse_statusline(&value, now_unix) {
+        if let Ok(mut snapshot) = parse_statusline(&value, now_unix) {
             if pace_enabled {
                 pace = pace_segment(&snapshot.windows, now_unix);
             }
+            stamp_session_account(&mut snapshot, &value);
             let generation = api_generation(&value);
             let _ = cache.save_statusline_observation_with_api_generation(
                 Provider::Claude,
@@ -117,6 +118,22 @@ pub fn run_statusline_hook() -> Result<()> {
         std::process::exit(output.exit_code.unwrap_or(1));
     }
     Ok(())
+}
+
+/// Record which account this session is signed in to, read from the profile
+/// the hook was started in. Panes on one account then share one quota row.
+fn stamp_session_account(snapshot: &mut ProviderSnapshot, value: &Value) {
+    let Some(session_id) = crate::cache::statusline_session_id(value).filter(|id| !id.is_empty())
+    else {
+        return;
+    };
+    let config_dir = std::env::var_os("CLAUDE_CONFIG_DIR").map(PathBuf::from);
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    if let Some(account) = account_digest(config_dir.as_deref(), home.as_deref()) {
+        snapshot
+            .session_accounts
+            .insert(session_id.to_string(), account);
+    }
 }
 
 /// Add the pace to the end of the wrapped command's last line so the status

@@ -24,13 +24,17 @@ spelling of that period (`Monthly` → `30d`), keeping its meter, and otherwise
 keeps a plain row instead of a truncated bar. Meters size to the connected
 Herdr endpoint's sidebar — indent and scrollbar included.
 Empty fields collapse; percentages can show remaining or used quota. Cache and
-TTL are off by default (turn them on in settings if you want them). Login-scoped
-vendors (Grok, Codex, Devin, OpenCode, Cursor) keep every tab visible in the
-Agent panel; duplicate 5h/7d/30d rows collapse to one pane per Space. On a
+TTL are off by default (turn them on in settings if you want them). Tabs that
+draw on the same quota keep every tab visible in the Agent panel; duplicate
+5h/7d/30d rows collapse to one pane per Space. Grok, Codex, Devin, OpenCode,
+Cursor, and Muse share by vendor; Claude by the account of the session's
+`CLAUDE_CONFIG_DIR` profile; omp, Pi, and Kilo by the account their session
+bills. A tab whose payer cannot be proven keeps its own row, and so does every
+Agy tab. Under Herdr's own agent order only adjacent tabs share a row. On a
 wide sidebar, the vendor icon and name sit above that pane's quota, and extra
 tabs list model, topic, and context with no icon. A settings row gap of 1 still
 separates different agents; nested extra tabs of the same vendor stay flush.
-Claude and Agy stay per-pane.
+Closing, moving, or leaving a tab regroups the tabs left behind right away.
 Agent order defaults to Space grouping with least quota left first inside each space.
 Low-quota notifications stay off until you set a threshold. Switch layout,
 fields, percentages, and optional pacing from the settings pane

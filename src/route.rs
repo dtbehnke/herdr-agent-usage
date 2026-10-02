@@ -415,6 +415,44 @@ mod tests {
         );
     }
 
+    #[test]
+    fn omp_panes_group_by_the_provider_and_account_they_bill() {
+        let evidence = crate::herdr::PayerEvidence::from_cache();
+        let key = |pane: &AgentPane| crate::herdr::nest_group_key(pane, &evidence);
+        let first = tempdir().unwrap();
+        let second = tempdir().unwrap();
+        let claude_a = omp_pane(&omp_session(first.path(), "session-anthropic.jsonl"));
+        let claude_b = omp_pane(&omp_session(second.path(), "session-anthropic.jsonl"));
+        let grok = omp_pane(&omp_session(first.path(), "session-xai-oauth.jsonl"));
+        assert!(key(&claude_a).is_some());
+        assert!(key(&grok).is_some());
+        assert_eq!(key(&claude_a), key(&claude_b));
+        assert_ne!(key(&claude_a), key(&grok));
+    }
+
+    /// A transcript without a `credential_pin` names no account: two such
+    /// sessions on one provider can be two logins or two omp profiles.
+    #[test]
+    fn omp_panes_without_an_account_pin_stay_standalone() {
+        let dir = tempdir().unwrap();
+        let path = omp_session(dir.path(), "session-anthropic.jsonl");
+        let unpinned = fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .filter(|line| !line.contains(r#""type":"credential_pin""#))
+            .map(|line| format!("{line}\n"))
+            .collect::<String>();
+        fs::write(&path, unpinned).unwrap();
+        let pane = omp_pane(&path);
+        let evidence = resolve_with_identity(&pane).omp.expect("evidence");
+        assert_eq!(evidence.provider_id, "anthropic");
+        assert_eq!(evidence.account_pin, None);
+        assert_eq!(
+            crate::herdr::nest_group_key(&pane, &crate::herdr::PayerEvidence::from_cache()),
+            None
+        );
+    }
+
     /// Two omp panes on one provider share its quota target but not a model:
     /// each identity comes from that pane's own transcript, including one long
     /// enough to be read as a window.

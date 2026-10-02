@@ -1072,12 +1072,13 @@ pub fn publish_icon_tokens(panes: &[AgentPane], sequence: u64) -> Result<()> {
         Ok(all) if !all.is_empty() => all,
         _ => panes.to_vec(),
     };
-    let nesting = vendor_nesting(&inventory, panes, &[]);
+    let order = panel_order();
+    let nesting = vendor_nesting(&inventory, panes, &[], order);
     let group_heads = group_head_pane_ids(
         &inventory,
         panes,
         &[],
-        group_head_uses_quota_order(),
+        order == PanelOrder::Quota,
         &nesting.stack,
         &BTreeSet::new(),
     );
@@ -1129,12 +1130,13 @@ fn publish_pane_tokens_inner(
         Ok(all) if !all.is_empty() => all,
         _ => panes.to_vec(),
     };
-    let nesting = vendor_nesting(&inventory, panes, tokens);
+    let order = panel_order();
+    let nesting = vendor_nesting(&inventory, panes, tokens, order);
     let group_heads = group_head_pane_ids(
         &inventory,
         panes,
         tokens,
-        group_head_uses_quota_order(),
+        order == PanelOrder::Quota,
         &nesting.stack,
         &BTreeSet::new(),
     );
@@ -1623,39 +1625,80 @@ fn vendor_nesting(
     inventory: &[AgentPane],
     overlay: &[AgentPane],
     tokens: &[PaneTokens],
+    order: PanelOrder,
 ) -> VendorNesting {
-    let overlay_ids = overlay
+    vendor_nesting_with(
+        inventory,
+        overlay,
+        tokens,
+        order,
+        &PayerEvidence::from_cache(),
+    )
+}
+
+fn vendor_nesting_with(
+    inventory: &[AgentPane],
+    overlay: &[AgentPane],
+    tokens: &[PaneTokens],
+    order: PanelOrder,
+    evidence: &PayerEvidence,
+) -> VendorNesting {
+    let overlay_by_id = overlay
+        .iter()
+        .map(|pane| (pane.pane_id.as_str(), pane))
+        .collect::<BTreeMap<_, _>>();
+    let inventory_ids = inventory
         .iter()
         .map(|pane| pane.pane_id.as_str())
         .collect::<BTreeSet<_>>();
-    let panes: Vec<&AgentPane> = overlay
+    // Inventory order is Herdr's draw order. This pass's copies replace the
+    // listed panes in place; a pane the inventory missed goes last.
+    let panes: Vec<&AgentPane> = inventory
         .iter()
+        .map(|pane| {
+            overlay_by_id
+                .get(pane.pane_id.as_str())
+                .copied()
+                .unwrap_or(pane)
+        })
         .chain(
-            inventory
+            overlay
                 .iter()
-                .filter(|pane| !overlay_ids.contains(pane.pane_id.as_str())),
+                .filter(|pane| !inventory_ids.contains(pane.pane_id.as_str())),
         )
         .collect();
-    let mut groups: BTreeMap<(String, u8), Vec<&AgentPane>> = BTreeMap::new();
+    let quota_groups = QuotaGroups::new(panes.iter().copied(), order, evidence);
+    let mut groups: BTreeMap<&GroupKey, Vec<&AgentPane>> = BTreeMap::new();
     for pane in &panes {
-        if pane.workspace_id.is_empty() || !shares_login_quota(pane.harness) {
-            continue;
+        if let Some(key) = quota_groups.key(&pane.pane_id) {
+            groups.entry(key).or_default().push(*pane);
         }
-        groups.entry(nest_group_key(pane)).or_default().push(*pane);
     }
     let mut heads = BTreeSet::new();
     let mut children = BTreeSet::new();
     let mut last_children = BTreeSet::new();
     let mut stack = BTreeMap::new();
     let mut header_icon = BTreeMap::new();
-    for ((_, index), members) in &groups {
+    let stride = crate::cli::AgentSelection::SUPPORTED.len() as u8;
+    let mut previous: Option<(&String, u8)> = None;
+    let mut subgroup = 0u8;
+    for (key, members) in &groups {
+        let (workspace, harness_index, _, _) = key;
+        subgroup = match previous {
+            Some(seen) if seen == (workspace, *harness_index) => subgroup + 1,
+            _ => 0,
+        };
+        previous = Some((workspace, *harness_index));
+        let index = harness_index
+            .saturating_add(subgroup.saturating_mul(stride))
+            .min(98);
         let min_head = members
             .iter()
             .map(|pane| published_headroom(pane, tokens))
             .min()
             .unwrap_or(u8::MAX);
         let nested = members.len() >= 2;
-        let head_id = vendor_group_head(members);
+        let head_id = quota_groups.head_of(key).to_string();
         if nested {
             heads.insert(head_id.clone());
             header_icon.insert(
@@ -1681,16 +1724,20 @@ fn vendor_nesting(
             );
         }
         if nested {
-            if let Some(last) = members
-                .iter()
-                .filter(|pane| pane.pane_id != head_id)
-                .max_by_key(|pane| {
+            let mut others = members.iter().filter(|pane| pane.pane_id != head_id);
+            // The gap belongs under whichever child Herdr draws last: the
+            // highest `quota_stack` in the quota view, the last listed pane
+            // in Herdr's own order.
+            let last = match order {
+                PanelOrder::Quota => others.max_by_key(|pane| {
                     (
                         stack.get(&pane.pane_id).cloned().unwrap_or_default(),
                         pane.pane_id.as_str(),
                     )
-                })
-            {
+                }),
+                PanelOrder::Layout => others.next_back(),
+            };
+            if let Some(last) = last {
                 last_children.insert(last.pane_id.clone());
             }
         }
@@ -1710,26 +1757,235 @@ fn vendor_nesting(
     }
 }
 
-pub(crate) fn shares_login_quota(harness: Harness) -> bool {
-    matches!(
-        harness,
-        Harness::Grok | Harness::Codex | Harness::Devin | Harness::OpenCode | Harness::Cursor
-    )
+/// How Herdr draws the Agent panel, which decides which panes can share a row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PanelOrder {
+    /// This plugin's quota view: `quota_stack` keeps every group contiguous.
+    Quota,
+    /// Herdr's own order: panes are drawn in inventory order, so a shared row
+    /// can only span a run of adjacent panes in one Space.
+    Layout,
 }
 
-/// Same-Space same-vendor group. Grok is one login-scoped vendor: the
-/// collector reads one `auth.json`, so two Grok tabs in a Space share 5h/7d.
-pub(crate) fn nest_group_key(pane: &AgentPane) -> (String, u8) {
-    (pane.workspace_id.clone(), harness_stack_index(pane.harness))
+pub(crate) fn panel_order() -> PanelOrder {
+    if group_head_uses_quota_order() {
+        PanelOrder::Quota
+    } else {
+        PanelOrder::Layout
+    }
 }
 
-fn vendor_group_head(members: &[&AgentPane]) -> String {
-    members
-        .iter()
-        .map(|pane| pane.pane_id.as_str())
-        .min()
-        .unwrap_or_default()
-        .to_string()
+/// Who pays for a pane, when that is not on the pane itself.
+///
+/// Claude's account is the digest its statusLine hook records in the Claude
+/// snapshot. That file is read at most once per pass, and only when a Claude
+/// pane with a session is grouped.
+pub(crate) struct PayerEvidence {
+    claude: std::cell::OnceCell<Option<crate::model::ProviderSnapshot>>,
+}
+
+impl PayerEvidence {
+    pub(crate) fn from_cache() -> Self {
+        Self {
+            claude: std::cell::OnceCell::new(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_claude(snapshot: crate::model::ProviderSnapshot) -> Self {
+        Self {
+            claude: std::cell::OnceCell::from(Some(snapshot)),
+        }
+    }
+
+    fn claude_account(&self, session_id: &str) -> Option<String> {
+        self.claude
+            .get_or_init(|| {
+                let target =
+                    crate::model::BillingTarget::original_four(crate::model::Provider::Claude);
+                crate::cache::CacheStore::from_env()
+                    .ok()?
+                    .load_target(&target)
+                    .ok()
+                    .flatten()
+            })
+            .as_ref()?
+            .account_for_session(session_id)
+            .map(str::to_string)
+    }
+}
+
+/// The payer a pane's row stands for, or `None` when nothing proves it.
+///
+/// Two panes share a row only when they would show the same account's
+/// numbers. A pane whose payer is unknown keeps its own row, because sharing
+/// on a guess shows one login's quota under another.
+fn quota_scope(pane: &AgentPane, evidence: &PayerEvidence) -> Option<String> {
+    match pane.harness {
+        // Each collector reads the one login on this machine.
+        Harness::Grok
+        | Harness::Codex
+        | Harness::Devin
+        | Harness::OpenCode
+        | Harness::Cursor
+        | Harness::Muse => Some(String::new()),
+        // Its statusLine names no account; the hook's stamp does.
+        Harness::Claude => evidence.claude_account(pane.session.as_ref()?.id()?),
+        // Its statusLine names no account, and nothing stamps one.
+        Harness::Agy => None,
+        Harness::Omp | Harness::Pi | Harness::Kilo => {
+            pane.session.as_ref()?;
+            memoized_scope(pane, session_quota_scope)
+        }
+    }
+}
+
+fn session_quota_scope(pane: &AgentPane) -> Option<String> {
+    if pane.harness == Harness::Omp {
+        let path = pane.session.as_ref()?.path()?;
+        let route = crate::omp::resolve_with_session(Some(path), |_, _| None);
+        // Without a `credential_pin` nothing names the account: two such
+        // sessions can be two logins or two omp profiles. A pin also drops
+        // out once a long transcript is read from its end, and the pane
+        // then keeps its own row.
+        return matches!(route.resolution, crate::model::Resolution::Subscription(_))
+            .then_some(route.evidence?)
+            .and_then(|evidence| {
+                Some(format!(
+                    "{}\0{}",
+                    evidence.provider_id, evidence.account_pin?
+                ))
+            });
+    }
+    match crate::route::resolve(pane) {
+        crate::model::Resolution::Subscription(target) => Some(target.cache_identity()),
+        _ => None,
+    }
+}
+
+fn memoized_scope(
+    pane: &AgentPane,
+    compute: impl FnOnce(&AgentPane) -> Option<String>,
+) -> Option<String> {
+    use std::sync::{Mutex, OnceLock};
+    use std::time::{Duration, Instant};
+    type Scopes = BTreeMap<String, (Instant, Option<String>)>;
+    static SCOPES: OnceLock<Mutex<Scopes>> = OnceLock::new();
+    const FRESH: Duration = Duration::from_secs(2);
+
+    let key = format!("{}\0{:?}", pane.pane_id, pane.session);
+    let scopes = SCOPES.get_or_init(Default::default);
+    if let Some((seen, scope)) = scopes.lock().ok()?.get(&key) {
+        if seen.elapsed() < FRESH {
+            return scope.clone();
+        }
+    }
+    let scope = compute(pane);
+    scopes
+        .lock()
+        .ok()?
+        .insert(key, (Instant::now(), scope.clone()));
+    scope
+}
+
+/// Same-Space same-payer group, or `None` for a pane that keeps its own row.
+/// Grok is one login-scoped vendor: the collector reads one `auth.json`, so
+/// two Grok tabs in a Space share 5h/7d.
+pub(crate) fn nest_group_key(
+    pane: &AgentPane,
+    evidence: &PayerEvidence,
+) -> Option<(String, u8, String)> {
+    if pane.workspace_id.is_empty() {
+        return None;
+    }
+    Some((
+        pane.workspace_id.clone(),
+        harness_stack_index(pane.harness),
+        quota_scope(pane, evidence)?,
+    ))
+}
+
+/// Space, harness, payer, and the pane that starts the group's run.
+pub(crate) type GroupKey = (String, u8, String, String);
+
+/// Which panes share one account row, and which pane carries it.
+///
+/// Every caller that asks "is this pane nested, and is it the head" reads
+/// this, so the sidebar roles and the quota rows cannot disagree.
+pub(crate) struct QuotaGroups {
+    keys: BTreeMap<String, GroupKey>,
+    heads: BTreeMap<GroupKey, String>,
+    sizes: BTreeMap<GroupKey, usize>,
+}
+
+impl QuotaGroups {
+    /// `panes` must be in Herdr's inventory order. Under Herdr's own order a
+    /// shared row can only span adjacent panes: a pane drawn between two
+    /// same-payer panes splits them, and each side keeps its own row. The
+    /// quota view sorts every group together, so there it is one group.
+    pub(crate) fn new<'a>(
+        panes: impl IntoIterator<Item = &'a AgentPane>,
+        order: PanelOrder,
+        evidence: &PayerEvidence,
+    ) -> Self {
+        let mut keys = BTreeMap::new();
+        let mut heads: BTreeMap<GroupKey, String> = BTreeMap::new();
+        let mut sizes = BTreeMap::new();
+        let mut drawn_before: BTreeMap<String, Option<GroupKey>> = BTreeMap::new();
+        for pane in panes {
+            let previous = drawn_before.get(&pane.workspace_id).cloned().flatten();
+            let key = nest_group_key(pane, evidence).map(|(workspace, index, scope)| {
+                let run = match (order, previous) {
+                    (PanelOrder::Quota, _) => String::new(),
+                    (PanelOrder::Layout, Some((w, i, s, run)))
+                        if (w.as_str(), i, s.as_str())
+                            == (workspace.as_str(), index, scope.as_str()) =>
+                    {
+                        run
+                    }
+                    (PanelOrder::Layout, _) => pane.pane_id.clone(),
+                };
+                (workspace, index, scope, run)
+            });
+            drawn_before.insert(pane.workspace_id.clone(), key.clone());
+            let Some(key) = key else {
+                continue;
+            };
+            *sizes.entry(key.clone()).or_insert(0usize) += 1;
+            // Herdr's order draws the run's first pane on top, so it carries
+            // the header. The quota view sorts the head by `quota_stack`, so
+            // any stable choice works; it keeps the lowest pane id.
+            heads
+                .entry(key.clone())
+                .and_modify(|head| {
+                    if order == PanelOrder::Quota && pane.pane_id < *head {
+                        head.clone_from(&pane.pane_id);
+                    }
+                })
+                .or_insert_with(|| pane.pane_id.clone());
+            keys.insert(pane.pane_id.clone(), key);
+        }
+        Self { keys, heads, sizes }
+    }
+
+    pub(crate) fn key(&self, pane_id: &str) -> Option<&GroupKey> {
+        self.keys.get(pane_id)
+    }
+
+    fn head_of(&self, key: &GroupKey) -> &str {
+        self.heads.get(key).map(String::as_str).unwrap_or_default()
+    }
+
+    /// The pane that shows the group's account quota.
+    pub(crate) fn head(&self, pane_id: &str) -> Option<&str> {
+        self.key(pane_id).map(|key| self.head_of(key))
+    }
+
+    pub(crate) fn is_nested(&self, pane_id: &str) -> bool {
+        self.key(pane_id)
+            .and_then(|key| self.sizes.get(key))
+            .is_some_and(|size| *size >= 2)
+    }
 }
 
 fn harness_stack_index(harness: Harness) -> u8 {
@@ -2704,7 +2960,7 @@ mod tests {
         extra.focused = true;
         extra.status = AgentStatus::Working;
         let inventory = vec![focused.clone(), extra.clone()];
-        let nesting = vendor_nesting(&inventory, &inventory, &[]);
+        let nesting = vendor_nesting(&inventory, &inventory, &[], PanelOrder::Quota);
         assert!(nesting.children.contains("w5:pD"));
         assert!(nesting.heads.contains("w5:pA"));
         assert!(
@@ -2739,7 +2995,7 @@ mod tests {
     }
 
     #[test]
-    fn claude_panes_in_one_space_do_not_nest() {
+    fn claude_panes_without_a_recorded_account_do_not_nest() {
         let panes = vec![
             AgentPane {
                 pane_id: "w1:p1".to_string(),
@@ -2768,7 +3024,205 @@ mod tests {
                 focused: false,
             },
         ];
-        let nesting = vendor_nesting(&panes, &panes, &[]);
+        let nesting = vendor_nesting(&panes, &panes, &[], PanelOrder::Quota);
+        assert!(nesting.heads.is_empty(), "{:?}", nesting.heads);
+        assert!(nesting.children.is_empty(), "{:?}", nesting.children);
+    }
+
+    fn claude_pane(id: &str, session: &str) -> AgentPane {
+        let mut pane = grouped_pane(id, Harness::Claude, &[]);
+        pane.session = Some(AgentSession {
+            kind: Some("id".to_string()),
+            value: session.to_string(),
+        });
+        pane
+    }
+
+    /// Two Claude logins, as two `CLAUDE_CONFIG_DIR` profiles give: only the
+    /// tabs whose hook recorded the same account share a row.
+    fn claude_accounts() -> PayerEvidence {
+        let mut snapshot =
+            crate::model::ProviderSnapshot::new(crate::model::Provider::Claude, vec![], 0)
+                .session_local();
+        for (session, account) in [
+            ("s-a1", "claude:a"),
+            ("s-a2", "claude:a"),
+            ("s-b", "claude:b"),
+        ] {
+            snapshot
+                .session_accounts
+                .insert(session.to_string(), account.to_string());
+        }
+        PayerEvidence::with_claude(snapshot)
+    }
+
+    #[test]
+    fn claude_panes_nest_only_on_one_recorded_account() {
+        let panes = vec![
+            claude_pane("w1:p1", "s-a1"),
+            claude_pane("w1:p2", "s-b"),
+            claude_pane("w1:p3", "s-a2"),
+            claude_pane("w1:p4", "s-unstamped"),
+        ];
+        let nesting =
+            vendor_nesting_with(&panes, &panes, &[], PanelOrder::Quota, &claude_accounts());
+        assert_eq!(nesting.heads, BTreeSet::from(["w1:p1".to_string()]));
+        assert_eq!(nesting.children, BTreeSet::from(["w1:p3".to_string()]));
+    }
+
+    #[test]
+    fn two_claude_accounts_in_one_space_never_share_a_stack_index() {
+        let panes = vec![
+            claude_pane("w1:p1", "s-a1"),
+            claude_pane("w1:p2", "s-a2"),
+            claude_pane("w1:p3", "s-b"),
+        ];
+        let nesting =
+            vendor_nesting_with(&panes, &panes, &[], PanelOrder::Quota, &claude_accounts());
+        let index = |id: &str| nesting.stack[id][3..5].to_string();
+        assert_eq!(index("w1:p1"), index("w1:p2"));
+        assert_ne!(index("w1:p1"), index("w1:p3"));
+    }
+
+    /// The screenshot case: under Herdr's own order the panel draws panes as
+    /// listed, so a group can only nest where its panes are adjacent.
+    #[test]
+    fn herdrs_own_order_nests_only_adjacent_panes() {
+        let panes = vec![
+            grouped_pane("w1:p1", Harness::Muse, &[]),
+            grouped_pane("w1:p3", Harness::Grok, &[]),
+            grouped_pane("w1:p4", Harness::Grok, &[]),
+            grouped_pane("w1:p5", Harness::Muse, &[]),
+        ];
+        let layout = vendor_nesting(&panes, &panes, &[], PanelOrder::Layout);
+        assert_eq!(layout.heads, BTreeSet::from(["w1:p3".to_string()]));
+        assert_eq!(layout.children, BTreeSet::from(["w1:p4".to_string()]));
+        assert_eq!(layout.last_children, BTreeSet::from(["w1:p4".to_string()]));
+        for (id, role) in [
+            ("w1:p1", VendorRow::Flat),
+            ("w1:p3", VendorRow::Head),
+            ("w1:p4", VendorRow::Child),
+            ("w1:p5", VendorRow::Flat),
+        ] {
+            let role_now = vendor_row_for(true, &layout, id);
+            assert_eq!(role_now, role, "{id}");
+            // Each flat Muse and the Grok group end with their own gap, so the
+            // groups never run into each other.
+            assert_eq!(
+                pane_takes_pack_gap(role_now, &layout, id),
+                role != VendorRow::Head,
+                "{id}"
+            );
+        }
+
+        let quota = vendor_nesting(&panes, &panes, &[], PanelOrder::Quota);
+        assert_eq!(
+            quota.heads,
+            BTreeSet::from(["w1:p1".to_string(), "w1:p3".to_string()])
+        );
+    }
+
+    /// Herdr's order draws the run's first pane on top, which is not always
+    /// the lowest pane id (`p10` sorts before `p7`).
+    #[test]
+    fn herdrs_own_order_puts_the_header_on_the_first_drawn_pane() {
+        let panes = vec![
+            grouped_pane("w1:p7", Harness::Grok, &[]),
+            grouped_pane("w1:p10", Harness::Grok, &[]),
+            grouped_pane("w1:p2", Harness::Grok, &[]),
+        ];
+        let nesting = vendor_nesting(&panes, &panes, &[], PanelOrder::Layout);
+        assert_eq!(nesting.heads, BTreeSet::from(["w1:p7".to_string()]));
+        assert_eq!(nesting.last_children, BTreeSet::from(["w1:p2".to_string()]));
+    }
+
+    /// A pane this pass publishes replaces its listed copy in place, so the
+    /// draw order the groups follow is still the inventory's.
+    #[test]
+    fn this_pass_keeps_the_inventory_draw_order() {
+        let inventory = vec![
+            grouped_pane("w1:p1", Harness::Grok, &[]),
+            grouped_pane("w1:p2", Harness::Muse, &[]),
+            grouped_pane("w1:p3", Harness::Grok, &[]),
+        ];
+        let publishing = vec![inventory[2].clone()];
+        let nesting = vendor_nesting(&inventory, &publishing, &[], PanelOrder::Layout);
+        assert!(nesting.heads.is_empty(), "{:?}", nesting.heads);
+    }
+
+    fn grouped_pane(id: &str, harness: Harness, tokens: &[(&str, &str)]) -> AgentPane {
+        AgentPane {
+            pane_id: id.to_string(),
+            workspace_id: "w1".to_string(),
+            cwd: String::new(),
+            title: String::new(),
+            harness,
+            session: None,
+            session_summary: String::new(),
+            topic: String::new(),
+            tokens: tokens
+                .iter()
+                .map(|(name, value)| (name.to_string(), value.to_string()))
+                .collect(),
+            status: AgentStatus::Idle,
+            focused: false,
+        }
+    }
+
+    #[test]
+    fn muse_panes_in_one_space_nest_under_one_head() {
+        let panes = vec![
+            grouped_pane("w1:p1", Harness::Muse, &[]),
+            grouped_pane("w1:p2", Harness::Muse, &[]),
+        ];
+        let nesting = vendor_nesting(&panes, &panes, &[], PanelOrder::Quota);
+        assert_eq!(nesting.heads, BTreeSet::from(["w1:p1".to_string()]));
+        assert_eq!(nesting.children, BTreeSet::from(["w1:p2".to_string()]));
+    }
+
+    /// Agy's statusLine names no account, so two Agy tabs on one pool may
+    /// still be two logins.
+    #[test]
+    fn agy_panes_do_not_nest_without_an_account() {
+        let panes = vec![
+            grouped_pane("w1:p1", Harness::Agy, &[("quota_model", "gemini-3-pro")]),
+            grouped_pane("w1:p2", Harness::Agy, &[("quota_model", "gemini-3-pro")]),
+        ];
+        let nesting = vendor_nesting(&panes, &panes, &[], PanelOrder::Quota);
+        assert!(nesting.heads.is_empty(), "{:?}", nesting.heads);
+        assert!(nesting.children.is_empty(), "{:?}", nesting.children);
+    }
+
+    #[test]
+    fn pi_and_kilo_panes_without_a_session_stay_standalone() {
+        let panes = vec![
+            grouped_pane("w1:p1", Harness::Pi, &[]),
+            grouped_pane("w1:p2", Harness::Pi, &[]),
+            grouped_pane("w1:p3", Harness::Kilo, &[]),
+            grouped_pane("w1:p4", Harness::Kilo, &[]),
+        ];
+        let nesting = vendor_nesting(&panes, &panes, &[], PanelOrder::Quota);
+        assert!(nesting.heads.is_empty(), "{:?}", nesting.heads);
+        assert!(nesting.children.is_empty(), "{:?}", nesting.children);
+    }
+
+    #[test]
+    fn omp_panes_without_a_billable_session_stay_standalone() {
+        let pane = |id: &str| AgentPane {
+            pane_id: id.to_string(),
+            workspace_id: "w1".to_string(),
+            cwd: String::new(),
+            title: String::new(),
+            harness: Harness::Omp,
+            session: None,
+            session_summary: String::new(),
+            topic: String::new(),
+            tokens: BTreeMap::new(),
+            status: AgentStatus::Idle,
+            focused: false,
+        };
+        let panes = vec![pane("w1:p1"), pane("w1:p2")];
+        let nesting = vendor_nesting(&panes, &panes, &[], PanelOrder::Quota);
         assert!(nesting.heads.is_empty(), "{:?}", nesting.heads);
         assert!(nesting.children.is_empty(), "{:?}", nesting.children);
     }
@@ -2802,7 +3256,7 @@ mod tests {
             focused: false,
         };
         let inventory = vec![head.clone(), extra];
-        let nesting = vendor_nesting(&inventory, &inventory, &[]);
+        let nesting = vendor_nesting(&inventory, &inventory, &[], PanelOrder::Quota);
         assert_eq!(
             nesting.header_icon.get("w5:pA").copied(),
             Some(AgentStatus::Idle)
@@ -3090,7 +3544,12 @@ mod tests {
             focused: false,
         };
         let inventory = vec![head.clone(), sibling.clone()];
-        let nesting = vendor_nesting(&inventory, std::slice::from_ref(&sibling), &[]);
+        let nesting = vendor_nesting(
+            &inventory,
+            std::slice::from_ref(&sibling),
+            &[],
+            PanelOrder::Quota,
+        );
         let heads = group_head_pane_ids(
             &inventory,
             std::slice::from_ref(&sibling),
@@ -3104,7 +3563,7 @@ mod tests {
         // Default order follows Herdr's inventory/layout order, even when a
         // later pane has less quota remaining.
         let reversed = vec![sibling.clone(), head.clone()];
-        let reversed_nesting = vendor_nesting(&reversed, &[], &[]);
+        let reversed_nesting = vendor_nesting(&reversed, &[], &[], PanelOrder::Quota);
         let default_heads = group_head_pane_ids(
             &reversed,
             &[],
@@ -3135,7 +3594,7 @@ mod tests {
             .tokens
             .insert(HEADROOM_TOKEN.to_string(), "016".to_string());
         let equal_inventory = vec![stable_first, stable_late];
-        let equal_nesting = vendor_nesting(&equal_inventory, &[], &[]);
+        let equal_nesting = vendor_nesting(&equal_inventory, &[], &[], PanelOrder::Quota);
         let equal_heads = group_head_pane_ids(
             &equal_inventory,
             &[],
@@ -3162,7 +3621,7 @@ mod tests {
             .tokens
             .insert(HEADROOM_TOKEN.to_string(), "016".to_string());
         let vendor_inventory = vec![layout_first, vendor_head];
-        let vendor_nesting = vendor_nesting(&vendor_inventory, &[], &[]);
+        let vendor_nesting = vendor_nesting(&vendor_inventory, &[], &[], PanelOrder::Quota);
         assert!(vendor_nesting.heads.contains("w1:p10"));
         let vendor_default_heads = group_head_pane_ids(
             &vendor_inventory,
