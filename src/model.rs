@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use thiserror::Error;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
@@ -822,14 +823,20 @@ impl ProviderSnapshot {
         self.session_accounts.get(session_id).map(String::as_str)
     }
 
-    /// The session whose quota a pane on `session_id` shows.
+    /// The session whose quota window a pane on `session_id` shows.
     ///
     /// A Claude session on a recorded account shows the newest reading of any
     /// session on that same account: the 5h/7d windows belong to the account,
     /// and an idle tab would otherwise keep a stale reading while a sibling has
-    /// a fresh one. A tie keeps the pane's own session. A session without an
-    /// account digest keeps its own windows, because nothing proves who pays.
-    fn quota_session_for_lookup<'a>(&'a self, session_id: &'a str) -> Option<&'a str> {
+    /// a fresh one. Compare each period independently: a newer 5h reading must
+    /// not replace a fresher 7d reading. A tie keeps the pane's own session.
+    /// A session without an account digest keeps its own windows, because
+    /// nothing proves who pays.
+    fn quota_session_for_lookup<'a>(
+        &'a self,
+        session_id: &'a str,
+        kind: WindowKind,
+    ) -> Option<&'a str> {
         let session_id = self.session_for_lookup(session_id)?;
         let Some(account) = self.account_for_session(session_id) else {
             return Some(session_id);
@@ -839,23 +846,24 @@ impl ProviderSnapshot {
                 .get(id)
                 .into_iter()
                 .flatten()
-                .filter_map(|observation| observation.observed_at_unix)
-                .max()
+                .find(|observation| observation.kind == kind)
+                .and_then(|observation| observation.observed_at_unix)
         };
         let own = freshness(session_id);
+        let has_window = |id: &str| {
+            self.session_windows
+                .get(id)
+                .is_some_and(|windows| window_in(windows, kind).is_some())
+        };
+        let own_has_window = has_window(session_id);
         let newest = self
             .session_accounts
             .iter()
             .filter(|(id, digest)| {
-                digest.as_str() == account
-                    && id.as_str() != session_id
-                    && self
-                        .session_windows
-                        .get(id.as_str())
-                        .is_some_and(|windows| !windows.is_empty())
+                digest.as_str() == account && id.as_str() != session_id && has_window(id)
             })
             .map(|(id, _)| (freshness(id), id.as_str()))
-            .filter(|(seen, _)| *seen > own)
+            .filter(|(seen, _)| !own_has_window || *seen > own)
             .max();
         Some(newest.map_or(session_id, |(_, id)| id))
     }
@@ -923,7 +931,7 @@ impl ProviderSnapshot {
         if self.provider != Provider::Claude || !self.session_quota_only {
             return None;
         }
-        let session_id = session_id.and_then(|id| self.quota_session_for_lookup(id))?;
+        let session_id = session_id.and_then(|id| self.quota_session_for_lookup(id, kind))?;
         self.session_quota_observations
             .get(session_id)?
             .iter()
@@ -947,13 +955,33 @@ impl ProviderSnapshot {
     /// 5. Every keyed map is empty → top-level windows (Grok/Codex/Devin and a
     ///    StatusLine cache written before session maps existed).
     /// 6. Keyed maps exist but this session is unknown → empty.
-    pub fn windows_for_session(&self, session_id: Option<&str>) -> &[UsageWindow] {
+    pub fn windows_for_session<'a>(&'a self, session_id: Option<&str>) -> Cow<'a, [UsageWindow]> {
+        if let Some(id) = session_id.filter(|id| self.account_for_session(id).is_some()) {
+            // This is a read-time projection. Raw session_windows stay intact
+            // so a later cache write cannot attribute a sibling's sample to us.
+            return Cow::Owned(
+                [
+                    WindowKind::FiveHour,
+                    WindowKind::Weekly,
+                    WindowKind::Monthly,
+                ]
+                .into_iter()
+                .filter_map(|kind| {
+                    let source = self.quota_session_for_lookup(id, kind)?;
+                    window_in(self.session_windows.get(source)?, kind).cloned()
+                })
+                .collect(),
+            );
+        }
+        Cow::Borrowed(self.raw_windows_for_session(session_id))
+    }
+
+    fn raw_windows_for_session(&self, session_id: Option<&str>) -> &[UsageWindow] {
         if self.provider == Provider::Agy && session_id.is_none() {
             return &self.windows;
         }
         if self.session_quota_only {
-            let Some(session_id) = session_id.and_then(|id| self.quota_session_for_lookup(id))
-            else {
+            let Some(session_id) = session_id.and_then(|id| self.session_for_lookup(id)) else {
                 return &[];
             };
             return self
@@ -1043,7 +1071,7 @@ impl ProviderSnapshot {
     /// session. Agy uses an exact or unambiguous statusLine conversation, so an
     /// unrelated Agy pane cannot make this pane inherit a different pool.
     pub fn displayed_quota_has_expired(&self, session_id: Option<&str>, now_unix: u64) -> bool {
-        quota_windows_expired(self.windows_for_session(session_id), now_unix)
+        quota_windows_expired(&self.windows_for_session(session_id), now_unix)
     }
 
     /// Keep a previously observed quota window when the latest payload omits

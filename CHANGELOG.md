@@ -44,10 +44,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Muse shares by vendor. Claude shares by account: the statusLine hook records
   a digest of the account and organization in `oauthAccount` from the
   `.claude.json` of the session's own `CLAUDE_CONFIG_DIR`, so two profiles on
-  two logins keep two rows and two profiles on one login share one. Claude tabs on one account
-  also show the newest reading any of them received, instead of an idle tab's
-  stale one. omp shares by the provider and the `credential_pin` account its
-  session bills, and Pi and Kilo by the billing target their session resolves
+  two logins keep two rows and two profiles on one login share one. Claude tabs
+  on one account show the newest reading for each period independently, with
+  that reading's own age, so updating 5h never replaces a fresher 7d or drops
+  a sibling's 7d window. omp shares by the provider and the `credential_pin`
+  account its session bills, and Pi and Kilo by the billing target their session resolves
   to. A tab whose payer cannot be proven keeps its own row: a Claude tab with
   no recorded account (an API-key login, or a session whose hook has not run
   since this update), an omp session without a pin, and every Agy tab, whose
