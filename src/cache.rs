@@ -1854,14 +1854,14 @@ mod tests {
             .snapshot;
         assert_eq!(
             used_percent(
-                saved.windows_for_session(Some("session-c")),
+                &saved.windows_for_session(Some("session-c")),
                 WindowKind::FiveHour
             ),
             92.0
         );
         assert_eq!(
             used_percent(
-                saved.windows_for_session(Some("session-a")),
+                &saved.windows_for_session(Some("session-a")),
                 WindowKind::FiveHour
             ),
             92.0
@@ -2404,7 +2404,7 @@ mod tests {
             .unwrap()
             .snapshot;
         assert!(window_in(
-            saved.windows_for_session(Some("session-a")),
+            &saved.windows_for_session(Some("session-a")),
             WindowKind::FiveHour
         )
         .is_some());
@@ -2520,7 +2520,7 @@ mod tests {
             .snapshot;
         assert_eq!(
             window_in(
-                saved.windows_for_session(Some("session-a")),
+                &saved.windows_for_session(Some("session-a")),
                 WindowKind::FiveHour
             )
             .unwrap()
@@ -3095,7 +3095,7 @@ mod tests {
         );
         assert_eq!(
             window_in(
-                saved.windows_for_session(Some("session-1")),
+                &saved.windows_for_session(Some("session-1")),
                 WindowKind::FiveHour
             )
             .unwrap()

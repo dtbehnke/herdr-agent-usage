@@ -184,6 +184,7 @@ impl MetadataTokens {
         style: PercentStyle,
         shape: SidebarShape,
     ) -> Self {
+        let session_windows = snapshot.windows_for_session(session_id);
         Self::from_snapshot_parts(
             snapshot,
             now_unix,
@@ -193,7 +194,7 @@ impl MetadataTokens {
             if session_id.is_none() {
                 &snapshot.windows
             } else {
-                snapshot.windows_for_session(session_id)
+                &session_windows
             },
             RowStyle::new(style, shape),
         )
@@ -264,7 +265,7 @@ impl MetadataTokens {
             session_id,
             quota_model,
             context,
-            windows,
+            &windows,
             row,
         )
     }
@@ -1087,6 +1088,120 @@ mod tests {
 
         assert_eq!(five_hour_at(&snapshot, 460, "older"), "5h stale 3m");
         assert_eq!(five_hour_at(&snapshot, 460, "newer"), "5h stale 3m");
+    }
+
+    fn claude_week(snapshot: &mut ProviderSnapshot, session: &str, used: f64, at: u64) {
+        snapshot
+            .session_windows
+            .get_mut(session)
+            .unwrap()
+            .push(window(WindowKind::Weekly, used, 14_820));
+        snapshot
+            .session_quota_observations
+            .get_mut(session)
+            .unwrap()
+            .push(SessionQuotaObservation {
+                kind: WindowKind::Weekly,
+                observed_at_unix: Some(at),
+                api_generation: None,
+            });
+    }
+
+    #[test]
+    fn claude_shared_quota_selects_each_windows_value_and_age_together() {
+        let mut snapshot = ProviderSnapshot::new(Provider::Claude, vec![], 100).session_local();
+        claude_session(&mut snapshot, "a", 10.0, 100, Some("claude:same"));
+        claude_week(&mut snapshot, "a", 80.0, 390);
+        claude_session(&mut snapshot, "b", 40.0, 400, Some("claude:same"));
+        claude_week(&mut snapshot, "b", 20.0, 100);
+        claude_session(&mut snapshot, "other", 99.0, 409, Some("claude:other"));
+        claude_week(&mut snapshot, "other", 99.0, 409);
+
+        for session in ["a", "b"] {
+            let tokens = MetadataTokens::from_snapshot_for_pane(
+                &snapshot,
+                410,
+                Some(session),
+                PercentStyle::Remaining,
+                SidebarShape::default(),
+            );
+            assert!(tokens.quota_5h.contains("60%"), "{}", tokens.quota_5h);
+            assert!(tokens.quota_week.contains("20%"), "{}", tokens.quota_week);
+            assert_eq!(tokens.quota_headroom, Some(20));
+            assert_eq!(
+                snapshot
+                    .quota_observation_for_session(Some(session), WindowKind::FiveHour)
+                    .unwrap()
+                    .observed_at_unix,
+                Some(400)
+            );
+            assert_eq!(
+                snapshot
+                    .quota_observation_for_session(Some(session), WindowKind::Weekly)
+                    .unwrap()
+                    .observed_at_unix,
+                Some(390)
+            );
+        }
+    }
+
+    #[test]
+    fn a_newer_claude_five_hour_reading_does_not_drop_a_siblings_week() {
+        let mut snapshot = ProviderSnapshot::new(Provider::Claude, vec![], 100).session_local();
+        claude_session(&mut snapshot, "a", 10.0, 390, Some("claude:same"));
+        claude_week(&mut snapshot, "a", 80.0, 390);
+        claude_session(&mut snapshot, "b", 40.0, 400, Some("claude:same"));
+        for session in ["a", "b"] {
+            let tokens = MetadataTokens::from_snapshot_for_pane(
+                &snapshot,
+                410,
+                Some(session),
+                PercentStyle::Remaining,
+                SidebarShape::default(),
+            );
+            assert!(tokens.quota_week.contains("20%"), "{}", tokens.quota_week);
+            assert_eq!(tokens.quota_headroom, Some(20));
+        }
+        // Sharing is a read-time view; it must not rewrite the raw session.
+        assert_eq!(snapshot.session_windows["b"].len(), 1);
+    }
+
+    #[test]
+    fn equal_claude_window_timestamps_keep_each_panes_own_reading() {
+        let mut snapshot = ProviderSnapshot::new(Provider::Claude, vec![], 100).session_local();
+        claude_session(&mut snapshot, "a", 10.0, 390, Some("claude:same"));
+        claude_week(&mut snapshot, "a", 20.0, 400);
+        claude_session(&mut snapshot, "b", 40.0, 390, Some("claude:same"));
+        claude_week(&mut snapshot, "b", 50.0, 100);
+        assert!(five_hour_at(&snapshot, 410, "a").contains("90%"));
+        assert!(five_hour_at(&snapshot, 410, "b").contains("60%"));
+    }
+
+    #[test]
+    fn unknown_claude_window_age_cannot_replace_a_dated_reading() {
+        let mut snapshot = ProviderSnapshot::new(Provider::Claude, vec![], 100).session_local();
+        claude_session(&mut snapshot, "a", 10.0, 390, Some("claude:same"));
+        claude_session(&mut snapshot, "b", 40.0, 400, Some("claude:same"));
+        snapshot.session_quota_observations.remove("b");
+        assert!(five_hour_at(&snapshot, 410, "a").contains("90%"));
+        assert!(five_hour_at(&snapshot, 410, "b").contains("90%"));
+        // An undated, missing period may still be shown, but never as live quota.
+        claude_week(&mut snapshot, "a", 80.0, 390);
+        snapshot
+            .session_quota_observations
+            .get_mut("a")
+            .unwrap()
+            .retain(|observation| observation.kind != WindowKind::Weekly);
+        let tokens = MetadataTokens::from_snapshot_for_pane(
+            &snapshot,
+            410,
+            Some("b"),
+            PercentStyle::Remaining,
+            SidebarShape::default(),
+        );
+        assert_eq!(tokens.quota_week_severity, Some(Severity::Unknown));
+        assert!(tokens.quota_week.contains("stale"), "{}", tokens.quota_week);
+        assert_eq!(tokens.quota_headroom, None);
     }
 
     #[test]
