@@ -20,6 +20,18 @@ fn isolated_plugin_command() -> Command {
     command
 }
 
+/// The Claude statusLine hook reads the account from `.claude.json` in
+/// `CLAUDE_CONFIG_DIR` or `$HOME`. Point both away from the developer's own
+/// profile, so a run never depends on who is signed in on this machine.
+fn isolated_claude_hook(home: &Path) -> Command {
+    let mut command = isolated_plugin_command();
+    command
+        .arg("claude-statusline")
+        .env("HOME", home)
+        .env_remove("CLAUDE_CONFIG_DIR");
+    command
+}
+
 fn sidebar_has_status_icon_rules(sidebar: &str) -> bool {
     sidebar.contains("$quota_icon")
         && sidebar.contains("fg = \"#f9e2af\"")
@@ -88,9 +100,8 @@ fn run_claude_collector_with_config_dir(
     input: &[u8],
     config_dir: Option<&Path>,
 ) {
-    let mut command = isolated_plugin_command();
+    let mut command = isolated_claude_hook(state);
     command
-        .arg("claude-statusline")
         .env("HERDR_PLUGIN_STATE_DIR", state)
         .env("HERDR_BIN_PATH", herdr)
         .stdin(Stdio::piped())
@@ -104,8 +115,7 @@ fn run_claude_collector_with_config_dir(
 }
 
 fn run_claude_statusline_output(state: &Path, input: &[u8]) -> std::process::Output {
-    let mut child = isolated_plugin_command()
-        .arg("claude-statusline")
+    let mut child = isolated_claude_hook(state)
         .env("HERDR_PLUGIN_STATE_DIR", state)
         .env_remove("HERDR_PLUGIN_CONFIG_DIR")
         .env_remove("HERDR_AGENT_QUOTA_STATUSLINE_PACE")
@@ -118,8 +128,7 @@ fn run_claude_statusline_output(state: &Path, input: &[u8]) -> std::process::Out
 }
 
 fn run_claude_collector_with_timeout(state: &Path, input: &[u8], timeout: Duration) -> bool {
-    let mut child = isolated_plugin_command()
-        .arg("claude-statusline")
+    let mut child = isolated_claude_hook(state)
         .env("HERDR_PLUGIN_STATE_DIR", state)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
@@ -554,8 +563,7 @@ fn sidebar_configuration_keeps_plugin_owned_gap_packed() {
 #[test]
 fn claude_collector_is_silent_without_a_previous_statusline() {
     let state = tempdir().unwrap();
-    let mut child = isolated_plugin_command()
-        .arg("claude-statusline")
+    let mut child = isolated_claude_hook(state.path())
         .env("HERDR_PLUGIN_STATE_DIR", state.path())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -2312,11 +2320,29 @@ fn no_alert_threshold_means_no_notification_however_low_the_quota_is() {
 /// nothing may be written.
 #[test]
 fn claude_collector_does_not_republish_unchanged_quota() {
+    // No recorded account: the pane keeps its own row, outside any group.
+    assert_claude_quota_is_not_republished(None, "042990042");
+}
+
+/// The same steady state for a session whose hook recorded its account: the
+/// pane is the head of its own one-pane group.
+#[test]
+fn claude_collector_does_not_republish_unchanged_quota_on_a_recorded_account() {
+    let profile = tempdir().unwrap();
+    fs::write(
+        profile.path().join(".claude.json"),
+        r#"{"oauthAccount":{"accountUuid":"uuid-a","organizationUuid":"org-a"}}"#,
+    )
+    .unwrap();
+    assert_claude_quota_is_not_republished(Some(profile.path()), "042000042");
+}
+
+fn assert_claude_quota_is_not_republished(profile: Option<&Path>, stack: &str) {
     let state = tempdir().unwrap();
     let (herdr_stub, herdr_log) = install_herdr_stub(
         state.path(),
         &format!(
-            r#"{{"result":{{"agents":[{{"agent":"claude","pane_id":"w1:p1","agent_session":{{"value":"test-session"}},"tokens":{{"quota_group":"w1","quota_icon":"{}","quota_provider":"Claude","quota_provider_model":"Claude","quota_5h_warning":"5h 42%","quota_week_normal":"7d 73%","quota_headroom":"042","quota_stack":"042000042","quota_nest_gap":"{}"}}}}]}}}}"#,
+            r#"{{"result":{{"agents":[{{"agent":"claude","pane_id":"w1:p1","agent_session":{{"value":"test-session"}},"tokens":{{"quota_group":"w1","quota_icon":"{}","quota_provider":"Claude","quota_provider_model":"Claude","quota_5h_warning":"5h 42%","quota_week_normal":"7d 73%","quota_headroom":"042","quota_stack":"{stack}","quota_nest_gap":"{}"}}}}]}}}}"#,
             "\u{e1a0}", "\u{200b}\u{2800}"
         ),
     );
@@ -2327,7 +2353,7 @@ fn claude_collector_does_not_republish_unchanged_quota() {
             "seven_day": {"used_percentage": 27.0}
         }
     }"#;
-    run_claude_collector(state.path(), &herdr_stub, input);
+    run_claude_collector_with_config_dir(state.path(), &herdr_stub, input, profile);
     assert!(
         !herdr_log.exists()
             || !fs::read_to_string(&herdr_log)
