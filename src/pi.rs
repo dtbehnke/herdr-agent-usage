@@ -199,6 +199,7 @@ pub(crate) struct ParsedSession {
     /// Latest `credential_pin` hash on the active branch, for the provider the
     /// session is talking to. omp writes it; Pi does not.
     pub(crate) credential_pin: Option<String>,
+    pub(crate) credential_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -397,6 +398,7 @@ fn parse_session_file(path: &Path) -> DetailedSessionLookup {
     let context_tokens = context_tokens(&branch);
     let cache_activity = cache_activity(&branch, &evidence.provider_id);
     let credential_pin = credential_pin(&branch, &evidence.provider_id);
+    let credential_id = serving_credential(&branch, &evidence.provider_id);
     let latest_usage = branch
         .iter()
         .rev()
@@ -418,7 +420,55 @@ fn parse_session_file(path: &Path) -> DetailedSessionLookup {
         usage_totals_cover_session: whole,
         cache_activity,
         credential_pin,
+        credential_id,
     }))
+}
+
+/// Stored credential that served the newest assistant reply for `provider_id`.
+///
+/// omp stamps `credentialId` only when a stored credential served the reply;
+/// a runtime, config, or environment key leaves it unstamped. An unstamped
+/// newest reply therefore reads as `None` rather than borrowing an older stamp.
+/// A reply interrupted before it reached a provider served nothing and is
+/// passed over.
+fn serving_credential(branch: &[&Value], provider_id: &str) -> Option<String> {
+    let reply = branch.iter().rev().find(|entry| {
+        entry.get("type").and_then(Value::as_str) == Some("message")
+            && entry.pointer("/message/role").and_then(Value::as_str) == Some("assistant")
+            && entry.pointer("/message/provider").and_then(Value::as_str) == Some(provider_id)
+            && !interrupted_before_serving(entry)
+    })?;
+    reply
+        .pointer("/message/credentialId")
+        .and_then(Value::as_u64)
+        .map(|id| id.to_string())
+}
+
+/// An Esc before the first token leaves an aborted reply with no stamp, no
+/// content, and no usage. omp stamps every reply a provider answered,
+/// aborted ones included, so this one says nothing about which key serves.
+fn interrupted_before_serving(entry: &Value) -> bool {
+    let message = &entry["message"];
+    message.get("stopReason").and_then(Value::as_str) == Some("aborted")
+        && message.get("credentialId").is_none()
+        && message
+            .get("content")
+            .and_then(Value::as_array)
+            .is_none_or(Vec::is_empty)
+        && message
+            .get("usage")
+            .and_then(usage_counters)
+            .is_none_or(|usage| {
+                [
+                    usage.input,
+                    usage.output,
+                    usage.cache_read,
+                    usage.cache_write,
+                    usage.total_tokens,
+                ]
+                .iter()
+                .all(|tokens| *tokens == 0)
+            })
 }
 
 /// Latest account pin recorded for `provider_id` on the active branch.
@@ -880,6 +930,22 @@ pub(crate) mod test_support {
     ) -> String {
         format!(
             r#"{{"type":"message","id":"{id}","parentId":"{parent}","message":{{"role":"assistant","provider":"{provider}","model":"{model}","stopReason":"stop","timestamp":1788224455470,"usage":{{"input":100,"output":10,"cacheRead":400,"cacheWrite":0,"contextTokens":{context_tokens}}}}}}}"#
+        )
+    }
+
+    /// The unstamped, empty reply omp writes when Esc lands before the first
+    /// token.
+    pub(crate) fn interrupted(id: &str, parent: &str, provider: &str, model: &str) -> String {
+        format!(
+            r#"{{"type":"message","id":"{id}","parentId":"{parent}","message":{{"role":"assistant","content":[],"provider":"{provider}","model":"{model}","usage":{{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"totalTokens":0}},"stopReason":"aborted","timestamp":1788224455470}}}}"#
+        )
+    }
+
+    /// `assistant` line stamped with omp's stored-credential `credentialId`.
+    pub(crate) fn stamped(assistant: String, credential: u64) -> String {
+        assistant.replace(
+            r#""stopReason""#,
+            &format!(r#""credentialId":{credential},"stopReason""#),
         )
     }
 
@@ -1384,6 +1450,62 @@ mod tests {
         let parsed = parsed(&paths, &path);
         assert_eq!(parsed.evidence.model_id.as_deref(), Some("model-new"));
         assert_eq!(parsed.credential_pin, None);
+    }
+
+    /// The serving credential is the newest reply's stamp. A reply served by a
+    /// runtime or config key carries none, and an older stored-credential stamp
+    /// does not stand in for it.
+    #[test]
+    fn an_unstamped_newest_reply_does_not_borrow_an_older_credential() {
+        let root = tempdir().unwrap();
+        let mut lines = header("session-stamps");
+        lines.push(model_change("m0", None, "opencode-go/model-a"));
+        lines.push(stamped(
+            assistant("a0", "m0", "opencode-go", "model-a", 900),
+            1,
+        ));
+        lines.push(stamped(
+            assistant("a1", "a0", "opencode-go", "model-a", 950),
+            2,
+        ));
+        let (paths, path) = write_session(root.path(), "session-stamps", &lines);
+        assert_eq!(parsed(&paths, &path).credential_id.as_deref(), Some("2"));
+
+        let unstamped = assistant("a2", "a1", "opencode-go", "model-a", 1000);
+        let mut runtime_key = lines.clone();
+        runtime_key.push(unstamped.clone());
+        let (paths, path) = write_session(root.path(), "session-stamps", &runtime_key);
+        assert_eq!(parsed(&paths, &path).credential_id, None);
+
+        let mut invalid = lines;
+        invalid.push(unstamped.replace(r#""stopReason""#, r#""credentialId":"1","stopReason""#));
+        let (paths, path) = write_session(root.path(), "session-stamps", &invalid);
+        assert_eq!(parsed(&paths, &path).credential_id, None);
+    }
+
+    /// Esc before the first token reached no provider, so the reply before it
+    /// still names the serving credential. An aborted reply that streamed
+    /// content without a stamp was served, by a key omp does not store.
+    #[test]
+    fn an_interruption_before_the_first_token_keeps_the_serving_credential() {
+        let root = tempdir().unwrap();
+        let mut lines = header("session-esc");
+        lines.push(model_change("m0", None, "opencode-go/model-a"));
+        lines.push(stamped(
+            assistant("a0", "m0", "opencode-go", "model-a", 900),
+            1,
+        ));
+        lines.push(interrupted("a1", "a0", "opencode-go", "model-a"));
+        let (paths, path) = write_session(root.path(), "session-esc", &lines);
+        assert_eq!(parsed(&paths, &path).credential_id.as_deref(), Some("1"));
+
+        let streamed = interrupted("a2", "a1", "opencode-go", "model-a").replace(
+            r#""content":[]"#,
+            r#""content":[{"type":"text","text":"x"}]"#,
+        );
+        lines.push(streamed);
+        let (paths, path) = write_session(root.path(), "session-esc", &lines);
+        assert_eq!(parsed(&paths, &path).credential_id, None);
     }
 
     /// The window opens on a line boundary whichever byte it starts at: the

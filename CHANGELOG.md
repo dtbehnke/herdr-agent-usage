@@ -59,6 +59,34 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- OpenCode tabs share a quota row only when they bill the same subscription.
+  Every OpenCode tab in a Space used to join one row whatever backend it was
+  talking to, so a pay-per-token tab (OpenCode Zen, Anthropic, …) could become
+  the head and hide the Go meters of the tab beside it. A tab whose session is
+  not on a subscription now keeps its own row, as omp, Pi, and Kilo tabs do.
+- An OpenCode 2 Go session served by the console login gets the Go meters
+  without a Go API key. The key in `auth.json` or `OPENCODE_API_KEY` was the
+  only accepted evidence, so a console-only install showed no quota at all.
+- With more than one console login in the OpenCode store, the Go meters come
+  from the connection OpenCode serves with (active first, then newest created)
+  instead of the most recently updated login. When that connection is one the
+  plugin cannot meter (a service-account key, or a login without a token or
+  workspace), no Go meters are shown: an older device login is not used in its
+  place, and neither is the Go API key.
+- Two omp tabs on a provider omp writes no `credential_pin` for (any API-key
+  login) share a row when the same omp profile served both from the same
+  stored credential. The newest reply names that credential, so tabs on one key
+  no longer stand alone. A newest reply served by a runtime or config key
+  carries none and keeps its own row; a reply interrupted before its first
+  token is passed over, so Esc does not split the row. Two profiles never
+  share a row this way.
+- A tab nested under a vendor head no longer jumps above that head when it
+  reports new quota. The group's sort key carries the tightest headroom among
+  its members, and an event that named one tab rewrote only that tab's key: the
+  head kept the old one, and the tab sorted above its own header with nothing
+  to show which account it belonged to. Every member whose key moved is now
+  republished in the same pass; unchanged members are not written.
+
 - Closing a tab, moving it to another Space, quitting its agent, or starting a
   different agent in it no longer leaves the tabs behind it nested under a
   vendor head, or without a Space header, until the next refresh. `pane.closed`,

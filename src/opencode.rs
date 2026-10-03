@@ -190,29 +190,47 @@ pub struct ConsoleCredential {
     pub account_id: String,
 }
 
-/// Reads the console login when the OpenCode store has one.
+/// The connection OpenCode serves its console with.
+pub enum ConsoleConnection {
+    /// A device login, whose meters this plugin reads.
+    Login(ConsoleCredential),
+    /// A service-account key or a malformed login. Its meters cannot be read,
+    /// and the Go API key is not what serves the console either.
+    Unmetered,
+}
+
+/// Reads the console connection when the OpenCode store has one.
 ///
-/// A store without the table, without a device login, or with a malformed
-/// value yields `None`, which keeps the key-based collector as the only
-/// source. Nothing here logs.
-pub fn console_credential(paths: &OpenCodePaths) -> Option<ConsoleCredential> {
+/// Only the connection OpenCode itself would serve with is read: the first
+/// stored row in its own `active, time_created, id` order. An older device
+/// login behind a service-account key is not used in its place. An
+/// environment-supplied connection serves only when no row is stored, and is
+/// not visible here. A store without the table, or with a schema OpenCode
+/// never shipped, yields `None`. Nothing here logs.
+pub fn console_connection(paths: &OpenCodePaths) -> Option<ConsoleConnection> {
     let connection = open_readonly(&paths.db).ok()?;
     if !table_exists(&connection, "credential").ok()? {
         return None;
     }
-    let mut statement = connection
-        .prepare(
-            "SELECT value FROM credential WHERE integration_id = ?1 ORDER BY time_updated DESC",
+    let value = connection
+        .query_row(
+            "SELECT value FROM credential WHERE integration_id = ?1 ORDER BY active DESC, time_created DESC, id DESC LIMIT 1",
+            ["opencode"],
+            |row| row.get::<_, String>(0),
         )
         .ok()?;
-    let mut rows = statement.query(["opencode"]).ok()?;
-    while let Some(row) = rows.next().ok()? {
-        let value = row.get::<_, String>(0).ok()?;
-        if let Some(credential) = parse_console_credential(&value) {
-            return Some(credential);
-        }
+    Some(
+        parse_console_credential(&value)
+            .map_or(ConsoleConnection::Unmetered, ConsoleConnection::Login),
+    )
+}
+
+/// The console login, when it is the connection OpenCode serves with.
+pub fn console_credential(paths: &OpenCodePaths) -> Option<ConsoleCredential> {
+    match console_connection(paths)? {
+        ConsoleConnection::Login(credential) => Some(credential),
+        ConsoleConnection::Unmetered => None,
     }
-    None
 }
 
 fn parse_console_credential(value: &str) -> Option<ConsoleCredential> {
@@ -262,12 +280,14 @@ fn parse_console_credential(value: &str) -> Option<ConsoleCredential> {
 ///
 /// A signed-in console owns the subscription meters OpenCode 2 panes spend;
 /// without one (OpenCode 1, or an install that never signed in) the Go API key
-/// is the serving credential.
+/// is the serving credential. A console served by a connection whose meters
+/// cannot be read names no account, so no cached reading is accepted for it.
 pub fn go_account_id(paths: &OpenCodePaths) -> Option<String> {
-    if let Some(credential) = console_credential(paths) {
-        return Some(credential.account_id);
+    match console_connection(paths) {
+        Some(ConsoleConnection::Login(credential)) => Some(credential.account_id),
+        Some(ConsoleConnection::Unmetered) => None,
+        None => go_key(paths).map(|key| crate::providers::credential_id(&key)),
     }
-    go_key(paths).map(|key| crate::providers::credential_id(&key))
 }
 
 /// Whether the OpenCode store holds a console login.
@@ -557,6 +577,27 @@ pub fn classify_opencode(
     }
 }
 
+pub fn classify_opencode_with_console(
+    lookup: SessionLookup,
+    auth: Result<&AuthMap, AuthReadError>,
+    env_go_key_present: bool,
+    console_login_present: impl FnOnce() -> bool,
+) -> crate::model::Resolution {
+    use crate::model::{BillingTarget, Resolution};
+
+    let go_session = matches!(
+        &lookup,
+        SessionLookup::Found(session)
+            if session.provider_id.as_deref().is_some_and(is_approved_go_provider)
+    );
+    match classify_opencode(lookup, auth, env_go_key_present) {
+        Resolution::Indeterminate if go_session && console_login_present() => {
+            Resolution::Subscription(BillingTarget::opencode_go())
+        }
+        resolution => resolution,
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn write_fixture_db(path: &Path, rows: &[(&str, &str)]) -> rusqlite::Result<()> {
     let connection = Connection::open(path)?;
@@ -707,12 +748,15 @@ mod tests {
         assert_eq!(credential.account_id, "console:acc_1:wrk_1");
     }
 
+    /// No table means no console connection. A login without an access token
+    /// is still the connection OpenCode serves with, so its meters are
+    /// unreadable rather than absent.
     #[test]
-    fn a_store_without_a_device_login_has_no_console_credential() {
+    fn a_store_without_a_usable_device_login_has_no_console_credential() {
         let directory = tempdir().unwrap();
         let db = directory.path().join("opencode.db");
         write_fixture_db(&db, &[]).unwrap();
-        assert!(console_credential(&paths_in(directory.path())).is_none());
+        assert!(console_connection(&paths_in(directory.path())).is_none());
 
         let directory = tempdir().unwrap();
         let db = directory.path().join("opencode.db");
@@ -733,6 +777,158 @@ mod tests {
         )
         .unwrap();
         assert!(console_credential(&paths_in(directory.path())).is_none());
+        assert!(matches!(
+            console_connection(&paths_in(directory.path())),
+            Some(ConsoleConnection::Unmetered)
+        ));
+    }
+
+    fn device_login(account: &str, org: &str) -> String {
+        format!(
+            r#"{{"type":"oauth","methodID":"device","access":"st_{account}","metadata":{{"accountID":"{account}","orgID":"{org}"}}}}"#
+        )
+    }
+
+    #[test]
+    fn the_active_console_login_wins_over_a_newer_inactive_one() {
+        let directory = tempdir().unwrap();
+        let db = directory.path().join("opencode.db");
+        let active = device_login("acc_active", "wrk_active");
+        let newer = device_login("acc_newer", "wrk_newer");
+        write_credential_fixture_db(
+            &db,
+            &[
+                ("cred_active", "opencode", active.as_str()),
+                ("cred_newer", "opencode", newer.as_str()),
+            ],
+        )
+        .unwrap();
+        let account = || {
+            console_credential(&paths_in(directory.path()))
+                .expect("console login")
+                .account_id
+        };
+        assert_eq!(account(), "console:acc_newer:wrk_newer");
+        Connection::open(&db)
+            .unwrap()
+            .execute("UPDATE credential SET active = (id = 'cred_active')", [])
+            .unwrap();
+        assert_eq!(account(), "console:acc_active:wrk_active");
+    }
+
+    /// OpenCode serves the console with its first credential, whatever its
+    /// type. A service-account key there is not a device login, an older login
+    /// behind it is not the one serving, and neither is the Go API key.
+    #[test]
+    fn a_current_service_account_key_is_not_replaced_by_an_older_device_login() {
+        let directory = tempdir().unwrap();
+        fs::write(
+            directory.path().join("auth.json"),
+            r#"{"opencode-go":{"type":"api","key":"sk-fixture"}}"#,
+        )
+        .unwrap();
+        let db = directory.path().join("opencode.db");
+        let device = device_login("acc_device", "wrk_device");
+        write_credential_fixture_db(
+            &db,
+            &[
+                ("cred_device", "opencode", device.as_str()),
+                (
+                    "cred_key",
+                    "opencode",
+                    r#"{"type":"key","key":"sk-service"}"#,
+                ),
+            ],
+        )
+        .unwrap();
+        let paths = paths_in(directory.path());
+        assert!(console_credential(&paths).is_none());
+        let connection = Connection::open(&db).unwrap();
+        connection
+            .execute("UPDATE credential SET active = (id = 'cred_key')", [])
+            .unwrap();
+        assert!(matches!(
+            console_connection(&paths),
+            Some(ConsoleConnection::Unmetered)
+        ));
+        assert_eq!(go_account_id(&paths), None);
+
+        connection
+            .execute("UPDATE credential SET active = (id = 'cred_device')", [])
+            .unwrap();
+        assert_eq!(
+            go_account_id(&paths).as_deref(),
+            Some("console:acc_device:wrk_device")
+        );
+    }
+
+    /// Without an active row OpenCode takes the newest created, then the
+    /// highest id. A refresh that bumps an older login's `time_updated` does
+    /// not move it ahead.
+    #[test]
+    fn without_an_active_login_the_newest_created_wins_then_the_highest_id() {
+        let directory = tempdir().unwrap();
+        let db = directory.path().join("opencode.db");
+        let two = device_login("acc_two", "wrk_1");
+        let one = device_login("acc_one", "wrk_1");
+        write_credential_fixture_db(
+            &db,
+            &[
+                ("cred_2", "opencode", two.as_str()),
+                ("cred_1", "opencode", one.as_str()),
+            ],
+        )
+        .unwrap();
+        let account = || {
+            console_credential(&paths_in(directory.path()))
+                .expect("console login")
+                .account_id
+        };
+        let connection = Connection::open(&db).unwrap();
+        connection
+            .execute(
+                "UPDATE credential SET time_updated = 99 WHERE id = 'cred_2'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(account(), "console:acc_one:wrk_1");
+        connection
+            .execute("UPDATE credential SET time_created = 5", [])
+            .unwrap();
+        assert_eq!(account(), "console:acc_two:wrk_1");
+    }
+
+    /// Every OpenCode `credential` table with `integration_id` also has
+    /// `active` and `time_created`. Any other shape cannot say which login
+    /// serves, so it names none.
+    #[test]
+    fn a_credential_table_from_an_unknown_schema_has_no_console_login() {
+        let directory = tempdir().unwrap();
+        let db = directory.path().join("opencode.db");
+        let connection = Connection::open(&db).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE credential (
+                    id TEXT PRIMARY KEY,
+                    integration_id TEXT,
+                    value TEXT NOT NULL,
+                    time_updated INTEGER NOT NULL
+                );",
+            )
+            .unwrap();
+        for (index, (id, account)) in [("cred_old", "acc_old"), ("cred_new", "acc_new")]
+            .into_iter()
+            .enumerate()
+        {
+            connection
+                .execute(
+                    "INSERT INTO credential (id, integration_id, value, time_updated)
+                     VALUES (?1, 'opencode', ?2, ?3)",
+                    rusqlite::params![id, device_login(account, "wrk_1"), index as i64 + 1],
+                )
+                .unwrap();
+        }
+        assert!(console_connection(&paths_in(directory.path())).is_none());
     }
 
     #[test]

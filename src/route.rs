@@ -7,8 +7,8 @@ use crate::kilo::{
 };
 use crate::model::{BillingTarget, ContextUsage, Harness, Resolution};
 use crate::opencode::{
-    classify_opencode, env_go_key_present, lookup_session, model_context_window, read_auth,
-    AuthReadError, OpenCodePaths, SessionEvidence, SessionLookup,
+    classify_opencode_with_console, console_credential, env_go_key_present, lookup_session,
+    model_context_window, read_auth, AuthReadError, OpenCodePaths, SessionEvidence, SessionLookup,
 };
 use crate::pi::PiPaths;
 use crate::providers::codex;
@@ -153,10 +153,11 @@ fn resolve_opencode_with_identity(
     let identity = session.and_then(opencode_identity);
     let context = session.and_then(|session| opencode_context(&paths, session));
     let auth = read_auth(&paths);
-    let resolution = classify_opencode(
+    let resolution = classify_opencode_with_console(
         lookup,
         auth.as_ref().map_err(|_| AuthReadError),
         env_go_key_present(),
+        || console_credential(&paths).is_some(),
     );
     ResolvedPane {
         resolution,
@@ -254,7 +255,9 @@ mod tests {
     use super::*;
     use crate::herdr::{AgentPane, AgentStatus};
     use crate::model::{CredentialScope, Provider};
-    use crate::opencode::{parse_auth_json, AuthReadError, SessionEvidence, SessionLookup};
+    use crate::opencode::{
+        classify_opencode, parse_auth_json, AuthReadError, SessionEvidence, SessionLookup,
+    };
     use std::collections::BTreeMap;
     use std::fs;
     use std::path::PathBuf;
@@ -451,6 +454,77 @@ mod tests {
             crate::herdr::nest_group_key(&pane, &crate::herdr::PayerEvidence::from_cache()),
             None
         );
+    }
+
+    /// An unpinned omp session whose first reply was served by stored
+    /// credential 1 and whose newest reply by `newest` (`None`: a runtime or
+    /// config key, which omp leaves unstamped).
+    fn omp_unpinned_session(
+        dir: &std::path::Path,
+        session_id: &str,
+        newest: Option<u64>,
+    ) -> String {
+        use crate::pi::test_support::*;
+
+        let mut lines = header(session_id);
+        lines.push(model_change("m0", None, "opencode-go/model-a"));
+        lines.push(stamped(
+            assistant("a0", "m0", "opencode-go", "model-a", 900),
+            1,
+        ));
+        let reply = assistant("a1", "a0", "opencode-go", "model-a", 950);
+        lines.push(match newest {
+            Some(credential) => stamped(reply, credential),
+            None => reply,
+        });
+        let sessions = dir.join(".omp/agent/sessions/-workspace");
+        fs::create_dir_all(&sessions).unwrap();
+        let path = sessions.join(format!("2099-01-01_{session_id}.jsonl"));
+        fs::write(&path, jsonl(&lines)).unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn unpinned_omp_panes_group_by_the_credential_that_served_them() {
+        let evidence = crate::herdr::PayerEvidence::from_cache();
+        let key = |path: &str| crate::herdr::nest_group_key(&omp_pane(path), &evidence);
+        let profile = tempdir().unwrap();
+        let other_profile = tempdir().unwrap();
+        let credential = |path: &str| {
+            resolve_with_identity(&omp_pane(path))
+                .omp
+                .expect("evidence")
+                .credential_id
+        };
+        let first = omp_unpinned_session(profile.path(), "session-one", Some(1));
+        let second = omp_unpinned_session(profile.path(), "session-two", Some(1));
+        let rotated = omp_unpinned_session(profile.path(), "session-three", Some(2));
+        let elsewhere = omp_unpinned_session(other_profile.path(), "session-four", Some(1));
+        let runtime_key = omp_unpinned_session(profile.path(), "session-five", None);
+        assert_eq!(credential(&first).as_deref(), Some("1"));
+        assert_eq!(credential(&rotated).as_deref(), Some("2"));
+        assert!(key(&first).is_some());
+        assert_eq!(key(&first), key(&second));
+        assert_ne!(key(&first), key(&rotated));
+        assert_ne!(key(&first), key(&elsewhere));
+        // Credential 1 served this session before an unstamped key took over,
+        // so nothing proves it shares a payer with `first`.
+        assert_eq!(credential(&runtime_key), None);
+        assert_eq!(key(&runtime_key), None);
+        // Esc before the first token reached no provider: the tab stays in
+        // `first`'s row instead of leaving and rejoining it.
+        let escaped = omp_unpinned_session(profile.path(), "session-six", Some(1));
+        let mut transcript = fs::read_to_string(&escaped).unwrap();
+        transcript.push_str(&crate::pi::test_support::interrupted(
+            "a2",
+            "a1",
+            "opencode-go",
+            "model-a",
+        ));
+        transcript.push('\n');
+        fs::write(&escaped, transcript).unwrap();
+        assert_eq!(credential(&escaped).as_deref(), Some("1"));
+        assert_eq!(key(&escaped), key(&first));
     }
 
     /// Two omp panes on one provider share its quota target but not a model:
@@ -790,6 +864,123 @@ mod tests {
         });
         assert_eq!(
             classify_opencode(payg, Ok(&empty), true),
+            Resolution::Indeterminate
+        );
+    }
+
+    #[test]
+    fn a_console_login_is_evidence_only_for_a_go_session() {
+        let empty = parse_auth_json(br#"{}"#).unwrap();
+        let session = |provider: &str| {
+            SessionLookup::Found(SessionEvidence {
+                session_id: "ses".to_string(),
+                provider_id: Some(provider.to_string()),
+                model_id: None,
+                context_tokens: None,
+            })
+        };
+        let go = Resolution::Subscription(BillingTarget::opencode_go());
+        assert_eq!(
+            classify_opencode_with_console(session("opencode-go"), Ok(&empty), false, || false),
+            Resolution::Indeterminate
+        );
+        assert_eq!(
+            classify_opencode_with_console(session("opencode-go"), Ok(&empty), false, || true),
+            go
+        );
+        assert_eq!(
+            classify_opencode_with_console(
+                session("opencode-go"),
+                Err(AuthReadError),
+                false,
+                || true
+            ),
+            go
+        );
+        let oauth =
+            parse_auth_json(br#"{"opencode-go":{"type":"oauth","access":"a","refresh":"r"}}"#)
+                .unwrap();
+        assert_eq!(
+            classify_opencode_with_console(session("opencode-go"), Ok(&oauth), false, || true),
+            go
+        );
+        assert_eq!(
+            classify_opencode_with_console(session("anthropic"), Ok(&empty), false, || {
+                unreachable!()
+            }),
+            Resolution::Indeterminate
+        );
+    }
+
+    #[test]
+    fn an_opencode_2_go_session_resolves_through_the_console_login() {
+        let dir = tempdir().unwrap();
+        let paths = write_opencode_v2(
+            dir.path(),
+            "{}",
+            &[(
+                "ses_go",
+                "assistant",
+                r#"{"model":{"id":"model-a","providerID":"opencode-go"}}"#,
+            )],
+        );
+        crate::opencode::write_credential_fixture_db(
+            &paths.db,
+            &[(
+                "cred_1",
+                "opencode",
+                r#"{"type":"oauth","methodID":"device","access":"st_access","metadata":{"accountID":"acc_1","orgID":"wrk_1"}}"#,
+            )],
+        )
+        .unwrap();
+        let go = Resolution::Subscription(BillingTarget::opencode_go());
+        assert_eq!(
+            resolve_opencode_with_identity(Some("ses_go"), Some(paths.clone())).resolution,
+            go
+        );
+        fs::remove_file(&paths.auth).unwrap();
+        assert_eq!(
+            resolve_opencode_with_identity(Some("ses_go"), Some(paths)).resolution,
+            go
+        );
+    }
+
+    /// A device login that is no longer the console connection OpenCode serves
+    /// with is not evidence that it pays for a Go session.
+    #[test]
+    fn an_inactive_console_login_does_not_prove_a_go_session() {
+        let dir = tempdir().unwrap();
+        let paths = write_opencode_v2(
+            dir.path(),
+            "{}",
+            &[(
+                "ses_go",
+                "assistant",
+                r#"{"model":{"id":"model-a","providerID":"opencode-go"}}"#,
+            )],
+        );
+        crate::opencode::write_credential_fixture_db(
+            &paths.db,
+            &[
+                (
+                    "cred_device",
+                    "opencode",
+                    r#"{"type":"oauth","methodID":"device","access":"st_access","metadata":{"accountID":"acc_1","orgID":"wrk_1"}}"#,
+                ),
+                (
+                    "cred_key",
+                    "opencode",
+                    r#"{"type":"key","key":"sk-service"}"#,
+                ),
+            ],
+        )
+        .unwrap();
+        rusqlite::Connection::open(&paths.db)
+            .unwrap()
+            .execute("UPDATE credential SET active = (id = 'cred_key')", [])
+            .unwrap();
+        assert_eq!(
+            resolve_opencode_with_identity(Some("ses_go"), Some(paths)).resolution,
             Resolution::Indeterminate
         );
     }
