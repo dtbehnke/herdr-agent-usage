@@ -25,12 +25,19 @@ pub fn owns_provider_comment(suffix: &str) -> bool {
 }
 
 pub fn is_managed_keybinding(command: &str) -> bool {
-    all_plugin_ids()
-        .any(|id| command == format!("{id}.refresh") || command == format!("{id}.open-settings"))
+    all_plugin_ids().any(|id| {
+        command == format!("{id}.refresh")
+            || command == format!("{id}.open-settings")
+            || command == format!("{id}.toggle-agent-order")
+    })
 }
 
 pub fn refresh_action() -> String {
     format!("{PLUGIN_ID}.refresh")
+}
+
+pub fn toggle_order_action() -> String {
+    format!("{PLUGIN_ID}.toggle-agent-order")
 }
 
 pub fn settings_action() -> String {

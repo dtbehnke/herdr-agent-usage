@@ -81,6 +81,7 @@ const QUOTA_ROW_MARKERS: [&str; 68] = [
 const ROW_GAP_MARKER: &str = PLUGIN_ID;
 const REFRESH_KEY: &str = "prefix+shift+r";
 const SETTINGS_KEY: &str = "prefix+shift+q";
+const TOGGLE_ORDER_KEY: &str = "prefix+shift+o";
 const CONFIG_PRESENCE_FILE: &str = "herdr-config.original.present";
 // Brand answers "who"; status answers "how much is left". All other text
 // inherits Herdr's active theme. Selected state may change background only —
@@ -497,6 +498,12 @@ fn rewrite_quota_sidebar(
         SETTINGS_KEY,
         &identity::settings_action(),
         "open agent quota settings",
+    )?;
+    add_plugin_keybinding(
+        &mut document,
+        TOGGLE_ORDER_KEY,
+        &identity::toggle_order_action(),
+        "toggle agent order: quota / tabs",
     )?;
     ensure_spaces_panel_sort(&mut document)?;
     let table = ensure_table(&mut document, &["ui", "sidebar", "agents"])?;
@@ -2218,7 +2225,14 @@ rows = [["state_icon", "agent"]]
                     updated.contains(&blocked_rule),
                     "{layout:?} is missing the blocked icon rule:\n{updated}"
                 );
-                let stable = updated.replace(&blocked_rule, "");
+                let toggle_key = "\n[[keys.command]]\nkey = \"prefix+shift+o\"\ntype = \"plugin_action\"\ncommand = \"herdr-agent-usage.toggle-agent-order\"\ndescription = \"toggle agent order: quota / tabs\"\n";
+                assert!(
+                    updated.contains(toggle_key),
+                    "{layout:?} is missing the agent order key:\n{updated}"
+                );
+                let stable = updated
+                    .replace(&blocked_rule, "")
+                    .replace(toggle_key, "");
                 assert_eq!(
                     format!("{:x}", Sha256::digest(stable.as_bytes())),
                     digest,

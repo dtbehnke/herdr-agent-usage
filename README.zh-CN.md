@@ -24,10 +24,11 @@ Grok、Codex、Devin、Cursor、Muse 按厂商；Claude 按会话所在
 `CLAUDE_CONFIG_DIR` 配置的账号；omp、Pi、Kilo、OpenCode 按会话实际计费的账号（omp 按
 credential pin，没有 pin 时按为该会话服务的 profile 与已存凭据）。无法确认计费方
 的标签页保留自己的额度行，Agy 标签页也一样。在 Herdr 自带的 agent 排序下，只有相邻的
-标签页才会共用一行。宽栏下主行只留图标、厂商名和额度，子行无图标，
+标签页才会共用一行；`quota` 和 `tabs` 排序会把同一账号的标签页画在一起。宽栏下主行只留图标、厂商名和额度，子行无图标，
 只显示 model、topic、cx。设置里的 1 行空格仍隔开不同 agent；同一厂商的嵌套子行贴在一起。窄栏仍平铺。
 另一个 Space 里的同厂商仍有自己的额度行。关闭、移动或退出标签页后，剩下的标签页会立即重新分组。Agent
-order 默认按 Space 分组，组内剩余额度最少的优先。
+order 默认按 Space 分组，组内剩余额度最少的优先；`tabs` 改为保持标签页顺序，
+`prefix+shift+o` 在两者之间切换。
 低额度通知默认关闭，直到你设置阈值。
 布局、字段和百分比口径都可以在设置面板里改（`prefix+shift+q`）。
 
@@ -163,7 +164,7 @@ herdr plugin pane open --plugin herdr-agent-usage --entrypoint settings --focus
 | Row gap | Agent 之间保留零行或一行空白 |
 | Watch interval | 30 秒–1 小时，默认 60 秒 |
 | Fields | 默认开启提供方、主题、模型、上下文、短期／长期／月度额度；cache 与 TTL 可选 |
-| Agent order | 按 Space 分组，组内剩余额度最少优先（默认）；或使用 Herdr 自己的排序 |
+| Agent order | 按 Space 分组，组内剩余额度最少优先（默认）；按 Space 保持标签页顺序、同一账号的标签页放在一起；或使用 Herdr 自己的排序 |
 | Low quota alert | 关闭，或设置 1%–100% 的提醒阈值 |
 | Agents | Claude、Codex、Grok、Agy、OpenCode、Pi、OMP、Devin、Muse、Cursor、Kilo |
 

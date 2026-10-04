@@ -429,7 +429,7 @@ fn run_internal(
 /// respawns the watcher. Event/focus/watch ticks stay off this path.
 fn restore_quota_agent_view(cache: &CacheStore) {
     let order = crate::configure::resolved_agent_order(None, Some(cache));
-    if order.is_quota() {
+    if order.owns_view() {
         crate::configure::apply_agent_order(order);
     }
 }
@@ -558,6 +558,10 @@ fn relayout(seed: Option<String>) -> Result<()> {
 
 fn stale_layout_workspaces(panes: &[AgentPane], order: PanelOrder) -> BTreeSet<String> {
     let groups = QuotaGroups::new(panes, order, &PayerEvidence::from_cache());
+    // The tabs view sorts by tab position, which a close, move, or new tab
+    // shifts without changing any group. Headroom-keyed stacks move only with
+    // quota, so the quota view never needs this check.
+    let positions = (order == PanelOrder::Tabs).then(|| vendor_stack_keys(panes, &[], order));
     let mut headers = BTreeMap::<&str, usize>::new();
     for pane in panes {
         if pane
@@ -571,17 +575,16 @@ fn stale_layout_workspaces(panes: &[AgentPane], order: PanelOrder) -> BTreeSet<S
     panes
         .iter()
         .filter(|pane| {
-            let misnested = match groups.head(&pane.pane_id) {
-                Some(head) => pane_needs_vendor_restyle(pane, &groups, head == pane.pane_id),
-                // A pane that shares no row, such as a Claude tab whose
-                // sibling turned out to be another login, must not keep a
-                // head's or a child's styling.
-                None => pane_keeps_nested_styling(pane),
-            };
+            let misnested = pane_misnested(pane, &groups);
             let misheaded = !pane.workspace_id.is_empty()
                 && plugin_quota_present(&pane.tokens)
                 && headers.get(pane.workspace_id.as_str()) != Some(&1);
-            misnested || misheaded
+            let misplaced = positions.as_ref().is_some_and(|stack| {
+                pane.tokens
+                    .get(STACK_TOKEN)
+                    .is_some_and(|published| stack.get(&pane.pane_id) != Some(published))
+            });
+            misnested || misheaded || misplaced
         })
         .map(|pane| pane.workspace_id.clone())
         .collect()
@@ -785,7 +788,7 @@ fn handle_named_pane(
     // what makes the alert land at the end of the turn that spent the quota
     // rather than at the next poll.
     notify_low_quota(cache, &tokens);
-    sync_vendor_row_siblings(&mut tokens, &mut panes);
+    sync_vendor_row_siblings(cache, row, &mut tokens, &mut panes)?;
     // Completion colour must land even if this pane is scrolled: the scroll
     // guard exists to protect reading transcript, not to leave a stale glyph.
     publish_status_icons(&panes, &tokens, CacheStore::now_millis(), row)
@@ -1618,7 +1621,7 @@ fn publish_resolved(
     }
     notify_low_quota(cache, &tokens);
     let mut publish_panes = panes.to_vec();
-    sync_vendor_row_siblings(&mut tokens, &mut publish_panes);
+    sync_vendor_row_siblings(cache, row, &mut tokens, &mut publish_panes)?;
     if allow_icon_while_scrolled {
         publish_pane_tokens_with_scrolled_icons(
             &publish_panes,
@@ -1656,9 +1659,33 @@ fn panes_for_vendor_rows(live: &[AgentPane]) -> Vec<AgentPane> {
 /// Mark the current pass, then republish same-Space extras whose account
 /// windows still disagree with the representative. An event that only names
 /// one Grok would otherwise leave a sibling showing duplicate 5h/7d/30d.
-fn sync_vendor_row_siblings(tokens: &mut Vec<PaneTokens>, panes: &mut Vec<AgentPane>) {
+///
+/// A pane whose payer changed (an omp tab moving from its plan model to the
+/// implementation provider, or back) leaves its old group in this pass. The
+/// panes it left behind are resolved here too, so they lose their nested
+/// styling now rather than at their own next event.
+fn sync_vendor_row_siblings(
+    cache: &CacheStore,
+    row: RowStyle,
+    tokens: &mut Vec<PaneTokens>,
+    panes: &mut Vec<AgentPane>,
+) -> Result<()> {
     let inventory = panes_for_vendor_rows(panes);
     let order = crate::herdr::panel_order();
+    let enabled = AgentSelection::from_args_or_env(&[]);
+    let now = CacheStore::now_unix();
+    for mut pane in left_behind_panes(&inventory, panes, order) {
+        if !enabled.contains(&pane.harness) {
+            continue;
+        }
+        let resolved = route::resolve_with_identity(&pane);
+        let Some(pane_tokens) = resolved_pane_tokens(cache, &mut pane, resolved, now, row, false)?
+        else {
+            continue;
+        };
+        panes.push(pane);
+        tokens.push(pane_tokens);
+    }
     mark_one_quota_row_per_vendor(tokens, &inventory, order);
     for extra in vendor_row_sync_extras(tokens, &inventory, order) {
         if let Some(pane) = inventory
@@ -1669,6 +1696,55 @@ fn sync_vendor_row_siblings(tokens: &mut Vec<PaneTokens>, panes: &mut Vec<AgentP
             panes.push(pane);
             tokens.push(extra);
         }
+    }
+    Ok(())
+}
+
+/// Panes in this pass's Spaces whose published styling no longer matches
+/// their group, and which this pass would not otherwise write.
+///
+/// The same test a layout pass applies, scoped to the Spaces the pass already
+/// touches, so a turn adds no inventory read and no write to a steady pane.
+fn left_behind_panes(
+    inventory: &[AgentPane],
+    publishing: &[AgentPane],
+    order: PanelOrder,
+) -> Vec<AgentPane> {
+    let groups = QuotaGroups::new(inventory, order, &PayerEvidence::from_cache());
+    let spaces = publishing
+        .iter()
+        .map(|pane| pane.workspace_id.as_str())
+        .collect::<BTreeSet<_>>();
+    let published = publishing
+        .iter()
+        .map(|pane| pane.pane_id.as_str())
+        .collect::<BTreeSet<_>>();
+    // A live group's other members are `vendor_row_sync_extras`' to restyle.
+    let live_groups = publishing
+        .iter()
+        .filter_map(|pane| groups.key(&pane.pane_id))
+        .collect::<BTreeSet<_>>();
+    inventory
+        .iter()
+        .filter(|pane| {
+            !published.contains(pane.pane_id.as_str())
+                && spaces.contains(pane.workspace_id.as_str())
+                && groups
+                    .key(&pane.pane_id)
+                    .is_none_or(|key| !live_groups.contains(key))
+                && pane_misnested(pane, &groups)
+        })
+        .cloned()
+        .collect()
+}
+
+/// Whether a pane's published styling disagrees with its group role.
+fn pane_misnested(pane: &AgentPane, groups: &QuotaGroups) -> bool {
+    match groups.head(&pane.pane_id) {
+        Some(head) => pane_needs_vendor_restyle(pane, groups, head == pane.pane_id),
+        // A pane that shares no row, such as a Claude tab whose sibling turned
+        // out to be another login, must not keep a head's or a child's styling.
+        None => pane_keeps_nested_styling(pane),
     }
 }
 
@@ -3333,6 +3409,66 @@ mod tests {
             stale_layout_workspaces(&panes, PanelOrder::Layout),
             BTreeSet::from(["w1".to_string()])
         );
+    }
+
+    /// A tab whose payer changed this turn (here: no longer a Grok) leaves its
+    /// old group in the same pass. The head it left behind is now alone and
+    /// must drop its shared rows now, not at its own next event; a steady pane
+    /// and a pane in another Space are not written.
+    #[test]
+    fn a_head_left_alone_by_a_payer_change_is_restyled_in_the_same_pass() {
+        let head = published_pane("w1:p1", "w1", Harness::Grok, &NESTED_HEAD);
+        let leaver = published_pane("w1:p2", "w1", Harness::Claude, &FLAT_CLAUDE[1..]);
+        let steady = published_pane("w1:p3", "w1", Harness::Claude, &FLAT_CLAUDE[1..]);
+        let elsewhere = published_pane("w2:p1", "w2", Harness::Grok, &NESTED_HEAD);
+        let inventory = [head, leaver.clone(), steady, elsewhere];
+        let left = left_behind_panes(&inventory, &[leaver], PanelOrder::Quota);
+        assert_eq!(
+            left.iter()
+                .map(|pane| pane.pane_id.as_str())
+                .collect::<Vec<_>>(),
+            ["w1:p1"]
+        );
+    }
+
+    /// The tabs view sorts by tab position. A tab that moves shifts the keys
+    /// of the panes around it without changing any group, and that alone has
+    /// to be republished.
+    #[test]
+    fn a_tab_move_under_the_tabs_order_needs_a_layout_pass() {
+        let with_stack = |tokens: &[(&'static str, &'static str)], stack: &'static str| {
+            let mut tokens = tokens.to_vec();
+            tokens.push((STACK_TOKEN, stack));
+            tokens
+        };
+        let flat = published_pane(
+            "w1:p0",
+            "w1",
+            Harness::Claude,
+            &with_stack(&FLAT_CLAUDE[1..], "0000000"),
+        );
+        let head = published_pane(
+            "w1:p1",
+            "w1",
+            Harness::Grok,
+            &with_stack(&NESTED_HEAD, "0010001"),
+        );
+        let child = published_pane(
+            "w1:p2",
+            "w1",
+            Harness::Grok,
+            &with_stack(&[("quota_model", "grok-4")], "0011002"),
+        );
+        let steady = [flat.clone(), head.clone(), child.clone()];
+        assert!(stale_layout_workspaces(&steady, PanelOrder::Tabs).is_empty());
+
+        let moved = [head, child, flat];
+        assert_eq!(
+            stale_layout_workspaces(&moved, PanelOrder::Tabs),
+            BTreeSet::from(["w1".to_string()])
+        );
+        // The quota view keys on headroom, so a move alone is not stale there.
+        assert!(stale_layout_workspaces(&moved, PanelOrder::Quota).is_empty());
     }
 
     #[test]

@@ -27,6 +27,11 @@ title = "Open agent quota settings"
 command = ["sh", "-c", "exec \"$HERDR_BIN_PATH\" plugin pane open --plugin herdr-agent-usage --entrypoint settings --focus"]
 
 [[actions]]
+id = "toggle-agent-order"
+title = "Toggle agent order (quota / tabs)"
+command = ["sh", "-c", "exec \"$HERDR_PLUGIN_ROOT/target/release/herdr-agent-usage\" toggle-order"]
+
+[[actions]]
 id = "uninstall"
 title = "Uninstall agent quota configuration"
 command = ["sh", "-c", "\"$HERDR_PLUGIN_ROOT/target/release/herdr-agent-usage\" configure --uninstall && herdr server reload-config"]
@@ -69,6 +74,11 @@ command = ["sh", "-c", "exec \"$HERDR_PLUGIN_ROOT/target/release/herdr-agent-usa
 [[events]]
 id = "closed-tab-agent-quota-layout"
 on = "tab.closed"
+command = ["sh", "-c", "exec \"$HERDR_PLUGIN_ROOT/target/release/herdr-agent-usage\" layout"]
+
+[[events]]
+id = "moved-tab-agent-quota-layout"
+on = "tab.moved"
 command = ["sh", "-c", "exec \"$HERDR_PLUGIN_ROOT/target/release/herdr-agent-usage\" layout"]
 
 [[panes]]

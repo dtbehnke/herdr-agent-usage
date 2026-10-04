@@ -371,7 +371,7 @@ pub fn notify(title: &str, body: &str) -> Result<()> {
 /// sidebar sort is never worth blocking a turn for.
 const SOCKET_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// Ask Herdr to order its Agent panel by space, then least quota left.
+/// Ask Herdr to order its Agent panel by space, then by this plugin's keys.
 ///
 /// Herdr keeps one Agent view and this replaces it. The default agent order
 /// is `quota`, so configure and startup both call this unless the user
@@ -379,21 +379,32 @@ const SOCKET_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 /// why the startup hook re-applies it.
 ///
 /// `workspace_order` keeps each Space contiguous — the same grouping Herdr's
-/// own spaces sort uses — so quota ranking never scatters one project's
-/// agents across the panel. Inside a space, `quota_headroom` ranks tightest
-/// first.
-pub fn set_quota_agent_view() -> Result<()> {
+/// own spaces sort uses — so neither order scatters one project's agents
+/// across the panel. Inside a space, `quota_stack` keeps every shared row
+/// together: under `quota` it leads with the group's tightest headroom, under
+/// `tabs` with the tab position of the group's first pane. Tab and pane order
+/// place a pane that carries no stack, as Herdr's own order would.
+pub fn set_agent_view(order: crate::cli::AgentOrder) -> Result<()> {
+    let sort = match order {
+        crate::cli::AgentOrder::Tabs => serde_json::json!([
+            {"field": "workspace_order", "order": "asc"},
+            {"field": {"token": STACK_TOKEN}, "order": "asc"},
+            {"field": "tab_order", "order": "asc"},
+            {"field": "pane_order", "order": "asc"},
+        ]),
+        _ => serde_json::json!([
+            {"field": "workspace_order", "order": "asc"},
+            {"field": {"token": STACK_TOKEN}, "order": "asc"},
+            {"field": {"token": HEADROOM_TOKEN}, "order": "asc"},
+        ]),
+    };
     socket_request(&serde_json::json!({
         "id": "agent-quota:view-set",
         "method": "agent.view.set",
         "params": {
             "source": identity::agent_view_source(),
-            "label": crate::cli::AgentOrder::LABEL,
-            "sort": [
-                {"field": "workspace_order", "order": "asc"},
-                {"field": {"token": STACK_TOKEN}, "order": "asc"},
-                {"field": {"token": HEADROOM_TOKEN}, "order": "asc"},
-            ],
+            "label": order.label(),
+            "sort": sort,
         },
     }))
     .map(|_| ())
@@ -1078,7 +1089,7 @@ pub fn publish_icon_tokens(panes: &[AgentPane], sequence: u64) -> Result<()> {
         &inventory,
         panes,
         &[],
-        order == PanelOrder::Quota,
+        order,
         &nesting.stack,
         &BTreeSet::new(),
     );
@@ -1136,7 +1147,7 @@ fn publish_pane_tokens_inner(
         &inventory,
         panes,
         tokens,
-        order == PanelOrder::Quota,
+        order,
         &nesting.stack,
         &BTreeSet::new(),
     );
@@ -1462,17 +1473,20 @@ fn collect_workspace_labels(value: &Value, labels: &mut BTreeMap<String, String>
 /// Herdr sorts by `quota_stack` and then `quota_headroom`; exact ties keep
 /// inventory order because the sort is stable. `quota_stack` is the overlay-
 /// aware map produced by `vendor_nesting`, so same-vendor heads stay ahead
-/// of their children just as they do in the Agent panel. `publishing` /
+/// of their children just as they do in the Agent panel. The tabs view sorts
+/// by `quota_stack` alone, which already leads with tab position. `publishing` /
 /// `tokens` overlay headroom for panes this pass is about to write so a
 /// forced refresh can move the header atomically.
 fn group_head_pane_ids(
     inventory: &[AgentPane],
     publishing: &[AgentPane],
     tokens: &[PaneTokens],
-    quota_order: bool,
+    order: PanelOrder,
     quota_stack: &BTreeMap<String, String>,
     vendor_heads: &BTreeSet<String>,
 ) -> BTreeMap<String, String> {
+    let stack_order = order != PanelOrder::Layout;
+    let quota_order = order == PanelOrder::Quota;
     let publishing_ids = publishing
         .iter()
         .map(|pane| pane.pane_id.as_str())
@@ -1503,7 +1517,7 @@ fn group_head_pane_ids(
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(u8::MAX)
         };
-        let stack = if quota_order {
+        let stack = if stack_order {
             quota_stack
                 .get(&pane.pane_id)
                 .cloned()
@@ -1531,7 +1545,7 @@ fn group_head_pane_ids(
         } else {
             0
         };
-        let stack = if quota_order {
+        let stack = if stack_order {
             quota_stack
                 .get(&pane.pane_id)
                 .cloned()
@@ -1554,16 +1568,6 @@ fn group_head_pane_ids(
         .into_iter()
         .map(|(workspace, (_, _, _, pane_id))| (workspace, pane_id))
         .collect()
-}
-
-/// Whether the Agent panel is under this plugin's quota-ranked view.
-///
-/// With `agent-order default`, Herdr owns the ordering and group headers must
-/// follow the inventory/layout order. With `quota`, header election must use
-/// the same `quota_stack` then `quota_headroom` keys as the Agent view.
-fn group_head_uses_quota_order() -> bool {
-    let cache = crate::cache::CacheStore::from_env().ok();
-    crate::configure::resolved_agent_order(None, cache.as_ref()).is_quota()
 }
 
 fn published_headroom(pane: &AgentPane, tokens: &[PaneTokens]) -> u8 {
@@ -1676,6 +1680,19 @@ fn vendor_nesting_with(
         )
         .collect();
     let quota_groups = QuotaGroups::new(panes.iter().copied(), order, evidence);
+    // Draw position inside the Space, for the tabs view: three digits so
+    // Herdr's text sort is the numeric one. Counted per Space, so a pane that
+    // closes in one Space does not move every key in the Spaces after it.
+    let mut drawn = BTreeMap::<&str, usize>::new();
+    let position = panes
+        .iter()
+        .map(|pane| {
+            let next = drawn.entry(pane.workspace_id.as_str()).or_default();
+            let index = (*next).min(999);
+            *next += 1;
+            (pane.pane_id.as_str(), index)
+        })
+        .collect::<BTreeMap<_, _>>();
     let mut groups: BTreeMap<&GroupKey, Vec<&AgentPane>> = BTreeMap::new();
     for pane in &panes {
         if let Some(key) = quota_groups.key(&pane.pane_id) {
@@ -1718,26 +1735,32 @@ fn vendor_nesting_with(
                 },
             );
         }
+        let head_position = position.get(head_id.as_str()).copied().unwrap_or(999);
         for pane in members {
-            let own = published_headroom(pane, tokens);
             let role = if nested && pane.pane_id != head_id {
                 children.insert(pane.pane_id.clone());
                 '1'
             } else {
                 '0'
             };
-            stack.insert(
-                pane.pane_id.clone(),
-                format!("{min_head:03}{index:02}{role}{own:03}"),
-            );
+            // The tabs view draws the group where its first pane sits, head
+            // first, children in tab order.
+            let key = if order == PanelOrder::Tabs {
+                let own = position.get(pane.pane_id.as_str()).copied().unwrap_or(999);
+                format!("{head_position:03}{role}{own:03}")
+            } else {
+                let own = published_headroom(pane, tokens);
+                format!("{min_head:03}{index:02}{role}{own:03}")
+            };
+            stack.insert(pane.pane_id.clone(), key);
         }
         if nested {
             let mut others = members.iter().filter(|pane| pane.pane_id != head_id);
             // The gap belongs under whichever child Herdr draws last: the
-            // highest `quota_stack` in the quota view, the last listed pane
+            // highest `quota_stack` in a plugin view, the last listed pane
             // in Herdr's own order.
             let last = match order {
-                PanelOrder::Quota => others.max_by_key(|pane| {
+                PanelOrder::Quota | PanelOrder::Tabs => others.max_by_key(|pane| {
                     (
                         stack.get(&pane.pane_id).cloned().unwrap_or_default(),
                         pane.pane_id.as_str(),
@@ -1752,8 +1775,13 @@ fn vendor_nesting_with(
     }
     for pane in panes {
         stack.entry(pane.pane_id.clone()).or_insert_with(|| {
-            let own = published_headroom(pane, tokens);
-            format!("{own:03}990{own:03}")
+            if order == PanelOrder::Tabs {
+                let own = position.get(pane.pane_id.as_str()).copied().unwrap_or(999);
+                format!("{own:03}0{own:03}")
+            } else {
+                let own = published_headroom(pane, tokens);
+                format!("{own:03}990{own:03}")
+            }
         });
     }
     VendorNesting {
@@ -1770,16 +1798,25 @@ fn vendor_nesting_with(
 pub(crate) enum PanelOrder {
     /// This plugin's quota view: `quota_stack` keeps every group contiguous.
     Quota,
+    /// This plugin's tabs view: inventory order, except that a group is drawn
+    /// together where its first pane sits.
+    Tabs,
     /// Herdr's own order: panes are drawn in inventory order, so a shared row
     /// can only span a run of adjacent panes in one Space.
     Layout,
 }
 
+/// The order Herdr's Agent panel is under, from the saved agent order.
+///
+/// With `agent-order default`, Herdr owns the ordering and group headers must
+/// follow the inventory/layout order. Under a plugin view, header election
+/// must use the same keys as that view.
 pub(crate) fn panel_order() -> PanelOrder {
-    if group_head_uses_quota_order() {
-        PanelOrder::Quota
-    } else {
-        PanelOrder::Layout
+    let cache = crate::cache::CacheStore::from_env().ok();
+    match crate::configure::resolved_agent_order(None, cache.as_ref()) {
+        crate::cli::AgentOrder::Quota => PanelOrder::Quota,
+        crate::cli::AgentOrder::Tabs => PanelOrder::Tabs,
+        crate::cli::AgentOrder::Default => PanelOrder::Layout,
     }
 }
 
@@ -1927,8 +1964,8 @@ pub(crate) struct QuotaGroups {
 impl QuotaGroups {
     /// `panes` must be in Herdr's inventory order. Under Herdr's own order a
     /// shared row can only span adjacent panes: a pane drawn between two
-    /// same-payer panes splits them, and each side keeps its own row. The
-    /// quota view sorts every group together, so there it is one group.
+    /// same-payer panes splits them, and each side keeps its own row. Both
+    /// plugin views sort every group together, so there it is one group.
     pub(crate) fn new<'a>(
         panes: impl IntoIterator<Item = &'a AgentPane>,
         order: PanelOrder,
@@ -1942,7 +1979,7 @@ impl QuotaGroups {
             let previous = drawn_before.get(&pane.workspace_id).cloned().flatten();
             let key = nest_group_key(pane, evidence).map(|(workspace, index, scope)| {
                 let run = match (order, previous) {
-                    (PanelOrder::Quota, _) => String::new(),
+                    (PanelOrder::Quota | PanelOrder::Tabs, _) => String::new(),
                     (PanelOrder::Layout, Some((w, i, s, run)))
                         if (w.as_str(), i, s.as_str())
                             == (workspace.as_str(), index, scope.as_str()) =>
@@ -1958,9 +1995,10 @@ impl QuotaGroups {
                 continue;
             };
             *sizes.entry(key.clone()).or_insert(0usize) += 1;
-            // Herdr's order draws the run's first pane on top, so it carries
-            // the header. The quota view sorts the head by `quota_stack`, so
-            // any stable choice works; it keeps the lowest pane id.
+            // Herdr's order and the tabs view draw the first pane on top, so
+            // it carries the header. The quota view sorts the head by
+            // `quota_stack`, so any stable choice works; it keeps the lowest
+            // pane id.
             heads
                 .entry(key.clone())
                 .and_modify(|head| {
@@ -3128,6 +3166,91 @@ mod tests {
         );
     }
 
+    /// The tabs view: one account's tabs share a row even with another
+    /// vendor's tabs between them, drawn where the first of them sits, and
+    /// every other pane keeps its tab position.
+    #[test]
+    fn the_tabs_order_keeps_one_account_together_in_tab_order() {
+        let panes = vec![
+            claude_pane("w1:p1", "s-a1"),
+            grouped_pane("w1:p7", Harness::Grok, &[]),
+            grouped_pane("w1:p8", Harness::Grok, &[]),
+            claude_pane("w1:p11", "s-a2"),
+            claude_pane("w1:p12", "s-b"),
+        ];
+        let layout =
+            vendor_nesting_with(&panes, &panes, &[], PanelOrder::Layout, &claude_accounts());
+        assert_eq!(layout.heads, BTreeSet::from(["w1:p7".to_string()]));
+
+        let tabs = vendor_nesting_with(&panes, &panes, &[], PanelOrder::Tabs, &claude_accounts());
+        assert_eq!(
+            tabs.heads,
+            BTreeSet::from(["w1:p1".to_string(), "w1:p7".to_string()])
+        );
+        assert_eq!(
+            tabs.children,
+            BTreeSet::from(["w1:p11".to_string(), "w1:p8".to_string()])
+        );
+        assert_eq!(tabs.last_children, tabs.children);
+        let mut drawn = panes
+            .iter()
+            .map(|pane| (tabs.stack[&pane.pane_id].clone(), pane.pane_id.as_str()))
+            .collect::<Vec<_>>();
+        drawn.sort();
+        assert_eq!(
+            drawn.iter().map(|(_, id)| *id).collect::<Vec<_>>(),
+            ["w1:p1", "w1:p11", "w1:p7", "w1:p8", "w1:p12"]
+        );
+        // Headroom never moves a tabs key, so a turn that spends quota does
+        // not rewrite it.
+        let spent = vec![PaneTokens {
+            pane_id: "w1:p11".to_string(),
+            quota: PaneQuotaUpdate::Preserve,
+            identity: None,
+            context: None,
+            show_account_quota: false,
+        }];
+        let mut low = panes.clone();
+        low[3]
+            .tokens
+            .insert(HEADROOM_TOKEN.to_string(), "003".to_string());
+        let after = vendor_nesting_with(&low, &low, &spent, PanelOrder::Tabs, &claude_accounts());
+        assert_eq!(after.stack, tabs.stack);
+
+        let heads = group_head_pane_ids(
+            &panes,
+            &[],
+            &[],
+            PanelOrder::Tabs,
+            &tabs.stack,
+            &BTreeSet::new(),
+        );
+        assert_eq!(heads.get("w1").map(String::as_str), Some("w1:p1"));
+
+        // Positions count inside a Space: closing a pane in an earlier Space
+        // leaves a later Space's keys alone.
+        let mut elsewhere = grouped_pane("w2:p1", Harness::Muse, &[]);
+        elsewhere.workspace_id = "w2".to_string();
+        let mut two_spaces = panes.clone();
+        two_spaces.push(elsewhere.clone());
+        let before = vendor_nesting_with(
+            &two_spaces,
+            &two_spaces,
+            &[],
+            PanelOrder::Tabs,
+            &claude_accounts(),
+        );
+        two_spaces.remove(1);
+        let after = vendor_nesting_with(
+            &two_spaces,
+            &two_spaces,
+            &[],
+            PanelOrder::Tabs,
+            &claude_accounts(),
+        );
+        assert_eq!(before.stack["w2:p1"], after.stack["w2:p1"]);
+    }
+
     /// Herdr's order draws the run's first pane on top, which is not always
     /// the lowest pane id (`p10` sorts before `p7`).
     #[test]
@@ -3560,7 +3683,7 @@ mod tests {
             &inventory,
             std::slice::from_ref(&sibling),
             &[],
-            true,
+            PanelOrder::Quota,
             &nesting.stack,
             &BTreeSet::new(),
         );
@@ -3574,7 +3697,7 @@ mod tests {
             &reversed,
             &[],
             &[],
-            false,
+            PanelOrder::Layout,
             &reversed_nesting.stack,
             &BTreeSet::new(),
         );
@@ -3583,7 +3706,7 @@ mod tests {
             &reversed,
             &[],
             &[],
-            true,
+            PanelOrder::Quota,
             &reversed_nesting.stack,
             &BTreeSet::new(),
         );
@@ -3605,7 +3728,7 @@ mod tests {
             &equal_inventory,
             &[],
             &[],
-            true,
+            PanelOrder::Quota,
             &equal_nesting.stack,
             &BTreeSet::new(),
         );
@@ -3633,7 +3756,7 @@ mod tests {
             &vendor_inventory,
             &[],
             &[],
-            false,
+            PanelOrder::Layout,
             &vendor_nesting.stack,
             &BTreeSet::new(),
         );
@@ -3645,7 +3768,7 @@ mod tests {
             &vendor_inventory,
             &[],
             &[],
-            true,
+            PanelOrder::Quota,
             &vendor_nesting.stack,
             &BTreeSet::new(),
         );

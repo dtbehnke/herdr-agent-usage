@@ -132,9 +132,10 @@ pub enum Command {
         /// run a fixed command line.
         #[arg(long, value_parser = parse_row_gap)]
         row_gap: Option<SidebarRowGap>,
-        /// How Herdr's Agent panel is ordered: default (Herdr's own policy)
-        /// or quota (least quota left first). `quota` installs a Herdr agent
-        /// view owned by this plugin and replaces the user's panel sort until
+        /// How Herdr's Agent panel is ordered: default (Herdr's own policy),
+        /// quota (least quota left first), or tabs (tab order, tabs sharing an
+        /// account kept together). `quota` and `tabs` install a Herdr agent
+        /// view owned by this plugin and replace the user's panel sort until
         /// it is set back to default.
         #[arg(long, value_enum)]
         agent_order: Option<AgentOrder>,
@@ -145,6 +146,9 @@ pub enum Command {
     },
     /// Render the settings pane shown in the Herdr popup pane.
     Settings,
+    /// Switch the Agent panel between the quota and tabs orders, then
+    /// republish the rows. From `default` it switches to quota.
+    ToggleOrder,
     /// Claude statusLine hook. Claude Code invokes this; not for manual use.
     ClaudeStatusline,
     /// Agy statusLine hook. Antigravity invokes this; not for manual use.
@@ -738,8 +742,10 @@ fn parse_row_gap(value: &str) -> Result<SidebarRowGap, String> {
 ///
 /// Default is `quota`: Space grouping is what most installs want with the
 /// `$quota_group` headers, and ranking by headroom is a free extra on top.
-/// Choose `default` to hand the panel back to Herdr's own policy (also
-/// Space-grouped unless the user set `priority`).
+/// `tabs` keeps Herdr's tab order but pulls the tabs that share one account
+/// up to the first of them, so a shared row never splits. Choose `default`
+/// to hand the panel back to Herdr's own policy (also Space-grouped unless
+/// the user set `priority`); there a shared row spans only adjacent tabs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
 pub enum AgentOrder {
     /// Leave Herdr's own ordering alone.
@@ -747,28 +753,52 @@ pub enum AgentOrder {
     /// By space, then least quota left first.
     #[default]
     Quota,
+    /// By space in tab order, tabs that share an account kept together.
+    Tabs,
 }
 
 impl AgentOrder {
     pub const ENV: &'static str = "HERDR_AGENT_QUOTA_AGENT_ORDER";
-    /// Herdr's label for the view, shown where it names the active sort.
-    pub const LABEL: &'static str = "Quota by space";
+    /// The order the settings pane steps through.
+    pub const CHOICES: [Self; 3] = [Self::Default, Self::Quota, Self::Tabs];
 
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Default => "default",
             Self::Quota => "quota",
+            Self::Tabs => "tabs",
         }
     }
 
-    pub fn is_quota(self) -> bool {
-        self == Self::Quota
+    /// Herdr's label for this plugin's view, shown where it names the active
+    /// sort. `default` installs no view, so it has none.
+    pub fn label(self) -> Option<&'static str> {
+        match self {
+            Self::Default => None,
+            Self::Quota => Some("Quota by space"),
+            Self::Tabs => Some("Grouped by tab"),
+        }
+    }
+
+    /// Whether this order is an Agent view this plugin installs and owns.
+    pub fn owns_view(self) -> bool {
+        self != Self::Default
+    }
+
+    /// The other grouped order: what the toggle action switches to. From
+    /// `default` it starts at the plugin's default.
+    pub fn toggled(self) -> Self {
+        match self {
+            Self::Quota => Self::Tabs,
+            Self::Default | Self::Tabs => Self::Quota,
+        }
     }
 
     pub fn parse(name: &str) -> Option<Self> {
         match name.trim().to_ascii_lowercase().as_str() {
             "default" | "herdr" | "off" => Some(Self::Default),
             "quota" | "headroom" | "grouped" | "on" => Some(Self::Quota),
+            "tabs" | "tab" => Some(Self::Tabs),
             _ => None,
         }
     }
@@ -1094,10 +1124,15 @@ mod tests {
 
     #[test]
     fn an_agent_order_round_trips_through_its_stored_form() {
-        for order in [AgentOrder::Default, AgentOrder::Quota] {
+        for order in AgentOrder::CHOICES {
             assert_eq!(AgentOrder::parse(order.as_str()), Some(order));
         }
         assert_eq!(AgentOrder::parse(" QUOTA "), Some(AgentOrder::Quota));
+        // An env value written before `tabs` existed keeps its meaning.
+        assert_eq!(AgentOrder::parse("grouped"), Some(AgentOrder::Quota));
+        assert_eq!(AgentOrder::Quota.toggled(), AgentOrder::Tabs);
+        assert_eq!(AgentOrder::Tabs.toggled(), AgentOrder::Quota);
+        assert_eq!(AgentOrder::Default.toggled(), AgentOrder::Quota);
         assert_eq!(AgentOrder::parse("sideways"), None);
         assert_eq!(AgentOrder::default(), AgentOrder::Quota);
     }

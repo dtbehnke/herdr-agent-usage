@@ -45,9 +45,10 @@
 # effect; identity text follows the sidebar theme and icons show status colour.
 #
 # --agent-order quota (default) keeps each Space contiguous and ranks by
-# least quota left inside the space; it replaces the panel's sort until it
-# is set back to default. default leaves Herdr's own agent panel ordering
-# alone (also Space-grouped unless the user set priority).
+# least quota left inside the space; tabs keeps tab order but draws the tabs
+# that share an account together. Both replace the panel's sort until it is
+# set back to default. default leaves Herdr's own agent panel ordering alone
+# (also Space-grouped unless the user set priority).
 #
 # --low-quota-alert off (default) never notifies. A percentage notifies once,
 # per provider, when its remaining quota falls to that number or below, and
@@ -178,8 +179,8 @@ case "$STATUSLINE_PACE" in
   *) die "statusline-pace must be off or on" ;;
 esac
 case "$AGENT_ORDER" in
-  ""|default|quota) ;;
-  *) die "agent-order must be default or quota" ;;
+  ""|default|quota|tabs) ;;
+  *) die "agent-order must be default, quota, or tabs" ;;
 esac
 # `0` is accepted as a spelling of off, the same as configure reads it.
 case "$LOW_QUOTA_ALERT" in

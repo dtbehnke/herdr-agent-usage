@@ -32,12 +32,14 @@ and Muse share by vendor; Claude by the account of the session's
 session bills (omp by its credential pin, else by the profile and stored
 credential that served the session). A tab whose payer cannot be proven keeps
 its own row, and so does every Agy tab. Under Herdr's own agent order only
-adjacent tabs share a row. On a
+adjacent tabs share a row; the `quota` and `tabs` orders draw every tab of one
+account together. On a
 wide sidebar, the vendor icon and name sit above that pane's quota, and extra
 tabs list model, topic, and context with no icon. A settings row gap of 1 still
 separates different agents; nested extra tabs of the same vendor stay flush.
 Closing, moving, or leaving a tab regroups the tabs left behind right away.
-Agent order defaults to Space grouping with least quota left first inside each space.
+Agent order defaults to Space grouping with least quota left first inside each space;
+`tabs` keeps tab order instead, and `prefix+shift+o` switches between the two.
 Low-quota notifications stay off until you set a threshold. Switch layout,
 fields, percentages, and optional pacing from the settings pane
 (`prefix+shift+q`).
@@ -179,7 +181,7 @@ herdr plugin pane open --plugin herdr-agent-usage --entrypoint settings --focus
 | Row gap | Zero or one blank line between agents |
 | Watch interval | 30 seconds–1 hour; default 60 seconds |
 | Fields | Provider, topic, model, context, short/long/monthly quota on by default; cache and TTL optional |
-| Agent order | Group by Space, least quota left first (default); or Herdr's own policy |
+| Agent order | Group by Space, least quota left first (default); by Space in tab order with one account's tabs together; or Herdr's own policy |
 | Low quota alert | Off or a threshold from 1% to 100% |
 | Agents | Claude, Codex, Grok, Agy, OpenCode, Pi, OMP, Devin, Muse, Cursor, Kilo |
 

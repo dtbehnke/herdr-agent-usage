@@ -28,6 +28,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   percentage drawn against a denominator that does not exist would be invented,
   and the credit pool's own ratio degenerates to a constant 100% on a drained
   account while reading as "quota exhausted".
+- **`--agent-order tabs`.** Keeps Herdr's tab order inside each Space, but
+  draws every tab of one account together where the first of them sits, so a
+  shared row never splits because another agent's tab sits between two of its
+  members. Herdr's own order still nests only adjacent tabs. The new
+  "Toggle agent order" action (`prefix+shift+o`) switches between `quota` and
+  `tabs`, and from `default` it turns `quota` on. Herdr disables the clickable
+  sort label while a plugin view is active, so the toggle is a key, not a click.
 
 
 ### Changed
@@ -59,6 +66,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- A tab whose payer changes mid-session — an omp tab moving from its plan
+  model to the implementation provider, or back — regroups the tabs it leaves
+  in the same pass. The tab it left behind used to keep its head or child
+  styling until its own next event, which for an idle tab could be never.
 - OpenCode tabs share a quota row only when they bill the same subscription.
   Every OpenCode tab in a Space used to join one row whatever backend it was
   talking to, so a pay-per-token tab (OpenCode Zen, Anthropic, …) could become

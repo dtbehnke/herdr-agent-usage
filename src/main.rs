@@ -42,6 +42,7 @@ fn main() -> Result<()> {
         Command::Layout => herdr_agent_quota::refresh::layout(),
         Command::Dashboard => herdr_agent_quota::dashboard::run(),
         Command::Settings => herdr_agent_quota::settings::run(),
+        Command::ToggleOrder => herdr_agent_quota::configure::toggle_agent_order(),
         Command::Configure {
             check,
             apply,
