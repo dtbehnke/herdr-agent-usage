@@ -165,7 +165,7 @@ fn omp_windows_keep_omps_normalized_labels() {
 fn omp_daily_is_rendered_as_1d_instead_of_being_dropped_or_renamed() {
     let usage = omp::parse_usage(&omp_usage(), "google-antigravity", 1);
     let snapshot = omp::snapshot(
-        &BillingTarget::omp("google-antigravity"),
+        &BillingTarget::omp(std::path::Path::new(".omp/agent"), "google-antigravity"),
         &usage.accounts[0],
     );
     let tokens = MetadataTokens::from_snapshot(&snapshot, 1_788_220_000);

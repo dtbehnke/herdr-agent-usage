@@ -184,7 +184,7 @@ Claude 状态栏节奏是独立开关，默认开启以保持升级前行为；�
 | Agy / Antigravity | StatusLine；5h、7d，以及 Gemini 会话上的 api（第三方池） | 精确会话与可确认的模型额度池 |
 | OpenCode | OpenCode 控制台 Go 额度；按 key 的 usage 接口作为回退 | OpenCode 存储（`credential` 表）里当前激活的控制台登录，没有 Go API key 时它也能证明 Go 会话；存储里没有任何控制台连接时才回退为 Go API key；确认的 PAYG 路由不显示订阅额度 |
 | Pi | 规范 Codex collector 的额度 | 仅在记录的账号一致时复用 |
-| OMP | `omp usage --json --provider <id>` | usage 账号与会话 credential pin 一致 |
+| OMP | `omp usage --json --provider <id>` | usage 账号与会话 credential pin 一致；多个已存 API key（omp 的报告不带身份信息）时显示整个池（`1/2 keys usable · next 3h10m`） |
 | Kilo Code | Kilo Pass 账号状态（`kiloPass.getState`）；30d | Kilo `auth.json` 里的 OAuth 网关登录，且只对后端为 Kilo Gateway 的会话生效；上下文取自该会话的消息与 Kilo 的模型目录 |
 
 Claude Code 状态栏始终保留用户自己的 statusLine 输出。**StatusLine pace** 默认开启以保持现有行为；

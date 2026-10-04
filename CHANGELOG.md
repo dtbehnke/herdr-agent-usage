@@ -70,6 +70,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   model to the implementation provider, or back — regroups the tabs it leaves
   in the same pass. The tab it left behind used to keep its head or child
   styling until its own next event, which for an idle tab could be never.
+- An omp pane on one of several stored API keys for the same provider (two
+  OpenCode Go keys, say) shows the key pool instead of "quota account is not
+  confirmed": how many keys still have quota and when the next exhausted one
+  resets (`1/2 keys usable · next 3h10m`). omp's key reports carry no
+  identity, so the pane cannot be matched to its own key; the pool is what
+  can be proved. That line is a reason, not a window, so it never ranks the
+  pane or fires a low-quota alert.
+- omp profiles no longer share a usage report or a refresh debounce. A pane
+  in one profile could show the only key of another profile's pool for the
+  same provider, and wait out that profile's debounce instead of asking its
+  own.
 - OpenCode tabs share a quota row only when they bill the same subscription.
   Every OpenCode tab in a Space used to join one row whatever backend it was
   talking to, so a pay-per-token tab (OpenCode Zen, Anthropic, …) could become

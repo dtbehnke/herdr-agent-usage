@@ -215,7 +215,7 @@ normal quota percentage instead of guessing.
 | Agy / Antigravity | StatusLine; 5h, 7d, and api (third-party pool on Gemini) | Exact session and identifiable model pool |
 | OpenCode | OpenCode console Go meters; per-key usage endpoint as fallback | The active console login stored by OpenCode (its `credential` table), which also proves a Go session without a key; the Go API key only when the store holds no console connection |
 | Pi | Canonical Codex quota | Only when the recorded account matches |
-| OMP | `omp usage --json --provider <id>` | Reported account matching the session's credential pin |
+| OMP | `omp usage --json --provider <id>` | Reported account matching the session's credential pin; one of several stored API keys, which omp reports without an identity, shows the pool (`1/2 keys usable · next 3h10m`) |
 | Kilo Code | Kilo Pass account state (`kiloPass.getState`); 30d | The OAuth gateway login in Kilo's `auth.json`, and only for a session whose backend is the Kilo Gateway; context from that session's messages and Kilo's model catalog |
 
 An OpenCode pane that has not started a session yet shows the account's Go

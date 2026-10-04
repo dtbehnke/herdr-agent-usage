@@ -114,7 +114,9 @@ Three properties hold that together, and each one is load bearing:
 An omp pane is billed in `CredentialScope::OMP_STORE`, not the canonical scope.
 An omp Claude pane and a Claude Code pane can be two different subscriptions,
 so they must never share a cache file; `BillingTarget::cache_identity` is what
-keeps them apart, and it is the reason that function appends a scope.
+keeps them apart, and it is the reason that function appends a scope. The omp
+target is also scoped by agent directory: every profile is its own credential
+pool, so two profiles never share a usage report or a debounce marker.
 
 Attribution is by omp's `credential_pin`: the transcript records
 `sha256(provider\0accountId\0email\0orgId\0projectId)` of the serving
@@ -123,6 +125,19 @@ report's identity. That digest is omp's persisted contract — if it changes
 upstream, every pin is orphaned and multi-account panes silently fall back to
 "no quota". The pinned-digest test exists to make that a test failure rather
 than a wrong number.
+
+An API key has no identity, so it has no pin, and omp's key reports (OpenCode
+Go: only `planType` and `endpoint`) carry nothing that names the key. With
+several keys a pane cannot be matched to its report. A pane a stored key
+served (the reply's `credentialId` set, no pin) then publishes
+`providers::omp::pool_summary` as `quota_error` (usable keys, next reset),
+never a window, so the pool cannot rank a pane or fire an alert. An unstamped
+reply came from a runtime or environment key outside the pool, and a pinned
+login is not one of its keys: both keep "not confirmed". The gate is
+`refresh::omp_pool_reason`, checked before the OAuth-failure match and shared
+by the refresh and debounce paths so both publish the same reason. omp lists
+an API key under `accountsWithoutUsage` only when its provider has no report
+at all, so a failed key beside a working one is invisible and not counted.
 
 ## Quota attribution and cache upgrades
 

@@ -423,6 +423,62 @@ pub fn oauth_without_usage_matches(usage: &ProviderUsage, pin: Option<&str>) -> 
     usage.oauth_without_usage_pins.len() == 1
 }
 
+/// The key pool's state, for a pane omp cannot attribute to one key.
+///
+/// API keys report no identity, so with several of them a pane cannot be
+/// matched to its own report. What is still provable is the pool: how many
+/// keys omp can rotate to, and when the next exhausted one comes back. It is a
+/// reason line, never a window, so it cannot rank the pane or fire an alert.
+///
+/// Only reported keys count. omp does not list a key whose usage fetch failed
+/// while another key of the provider reported, so it cannot be counted.
+pub fn pool_summary(usage: &ProviderUsage, now_unix: u64) -> Option<String> {
+    // A report with a pin is an OAuth login, not one of the keys.
+    let keys: Vec<_> = usage
+        .accounts
+        .iter()
+        .filter(|account| account.pin.is_none())
+        .collect();
+    if keys.len() < 2 {
+        return None;
+    }
+    let mut usable = 0;
+    let mut next: Option<u64> = None;
+    let mut every_reset_known = true;
+    for account in &keys {
+        let exhausted: Vec<_> = account
+            .windows
+            .iter()
+            .filter(|window| window.remaining_percent <= 0.0 && window.is_current(now_unix))
+            .collect();
+        if exhausted.is_empty() {
+            usable += 1;
+            continue;
+        }
+        // A key is back only once every window it exhausted has reset.
+        let back = exhausted
+            .iter()
+            .map(|window| window.resets_at.map(ResetAt::unix_seconds))
+            .collect::<Option<Vec<_>>>()
+            .and_then(|resets| resets.into_iter().max());
+        match back {
+            Some(back) => next = Some(next.map_or(back, |next| next.min(back))),
+            None => every_reset_known = false,
+        }
+    }
+    let mut summary = format!("{usable}/{} keys usable", keys.len());
+    // An exhausted key with no reset could come back first, so a partial
+    // answer is no answer.
+    if let (true, Some(next)) = (every_reset_known, next) {
+        summary.push_str(" · next ");
+        summary.push_str(&crate::presentation::format_reset_eta(
+            ResetAt::from_unix_seconds(next),
+            now_unix,
+        ));
+    }
+    Some(summary)
+}
+
 pub fn snapshot(target: &BillingTarget, account: &AccountUsage) -> ProviderSnapshot {
     let mut snapshot = ProviderSnapshot::new(
         target.billing,
@@ -601,6 +657,69 @@ mod tests {
         // Two accounts and no pin is not a coin flip.
         assert_eq!(select_account(&usage, None), None);
         assert_eq!(select_account(&usage, Some("third")), None);
+    }
+
+    /// An OpenCode Go key report as omp writes it: no identity at all, only
+    /// the plan name and endpoint.
+    fn key_report(used: f64, resets_ms: Option<u64>) -> Value {
+        let mut window = json!({"id": "5h", "durationMs": 18_000_000u64});
+        if let Some(resets_ms) = resets_ms {
+            window["resetsAt"] = json!(resets_ms);
+        }
+        json!({
+            "provider": "opencode-go",
+            "metadata": {"planType": "OpenCode Go", "endpoint": "https://opencode.ai/zen/go/v1/usage"},
+            "limits": [{"id": "5h", "window": window, "amount": {"usedFraction": used}}]
+        })
+    }
+
+    /// Nothing in either report says which key serves the pane.
+    #[test]
+    fn two_api_keys_stay_unattributed() {
+        let value = json!({"reports": [key_report(0.1, None), key_report(0.9, None)]});
+        let usage = parse_usage(&value, "opencode-go", 0);
+        assert_eq!(usage.accounts.len(), 2);
+        assert_eq!(select_account(&usage, None), None);
+    }
+
+    #[test]
+    fn the_pool_summary_counts_usable_keys_and_the_next_comeback() {
+        let now = 1_000;
+        let value = json!({"reports": [
+            key_report(0.2, Some(5_000_000)),
+            key_report(1.0, Some(4_600_000)),
+            key_report(1.0, Some(8_200_000)),
+            // Exhausted, but its window reset already: usable again.
+            key_report(1.0, Some(900_000)),
+        ]});
+        let usage = parse_usage(&value, "opencode-go", now);
+        assert_eq!(
+            pool_summary(&usage, now).as_deref(),
+            Some("2/4 keys usable · next 1h00m")
+        );
+        // An exhausted key with no reset could come back first.
+        let value = json!({"reports": [
+            key_report(1.0, Some(4_600_000)),
+            key_report(1.0, None),
+        ]});
+        assert_eq!(
+            pool_summary(&parse_usage(&value, "opencode-go", now), now).as_deref(),
+            Some("0/2 keys usable")
+        );
+        // One key is attributable on its own; no summary.
+        let value = json!({"reports": [key_report(1.0, None)]});
+        assert_eq!(
+            pool_summary(&parse_usage(&value, "opencode-go", now), now),
+            None
+        );
+        // An OAuth login beside one key is not a second key.
+        let mut usage = parse_usage(&value, "opencode-go", now);
+        usage.accounts.push(AccountUsage {
+            pin: Some("oauth".to_string()),
+            windows: vec![],
+            fetched_at_unix: now,
+        });
+        assert_eq!(pool_summary(&usage, now), None);
     }
 
     /// The whole subprocess path, against a stub that records how it was

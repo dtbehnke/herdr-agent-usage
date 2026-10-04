@@ -1540,7 +1540,7 @@ mod tests {
     fn omp_upgrade_preserves_only_an_explicitly_confirmed_failed_account() {
         let directory = tempdir().unwrap();
         let cache = CacheStore::new(directory.path());
-        let target = BillingTarget::omp("anthropic");
+        let target = BillingTarget::omp(std::path::Path::new(".omp/agent"), "anthropic");
         let mut previous = snapshot();
         previous.account_id = Some("old-pin".into());
         cache.save_target(&target, &previous).unwrap();
