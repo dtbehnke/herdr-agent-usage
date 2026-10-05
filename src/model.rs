@@ -243,11 +243,20 @@ impl BillingTarget {
     }
 
     /// An omp-scoped target for a subscription omp routes a pane to.
-    pub fn omp(provider_id: &str) -> Self {
+    ///
+    /// Scoped by agent directory as well as provider: each omp profile has its
+    /// own credential pool, and a stored credential's id is a row number in
+    /// that pool's `agent.db`. Two profiles must never share a usage report or
+    /// a debounce marker, or one profile's credential 3 reads another's.
+    pub fn omp(agent_dir: &std::path::Path, provider_id: &str) -> Self {
+        let mut hasher = Sha256::new();
+        hasher.update(agent_dir.as_os_str().as_encoded_bytes());
+        hasher.update([0u8]);
+        hasher.update(provider_id.as_bytes());
         Self {
             billing: Provider::Omp,
             credential_scope: CredentialScope::OMP_STORE,
-            scope_hash: Some(Sha256::digest(provider_id.as_bytes()).into()),
+            scope_hash: Some(hasher.finalize().into()),
         }
     }
 

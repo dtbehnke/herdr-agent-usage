@@ -176,6 +176,7 @@ impl Settings {
             Choice::Order => match self.order {
                 AgentOrder::Default => "Herdr's own policy",
                 AgentOrder::Quota => "by Space, least quota left first",
+                AgentOrder::Tabs => "tab order, one account together",
             },
             Choice::Alert => match self.alert.is_off() {
                 true => "no notification",
@@ -243,10 +244,13 @@ impl Settings {
                 }
             }
             Row::Choice(Choice::Order) => {
-                self.order = match self.order {
-                    AgentOrder::Default => AgentOrder::Quota,
-                    AgentOrder::Quota => AgentOrder::Default,
-                }
+                let current = AgentOrder::CHOICES
+                    .iter()
+                    .position(|value| *value == self.order)
+                    .unwrap_or(0);
+                let count = AgentOrder::CHOICES.len() as i8;
+                let next = (current as i8 + step).rem_euclid(count);
+                self.order = AgentOrder::CHOICES[next as usize];
             }
             Row::Choice(Choice::Alert) => {
                 let current = LowQuotaAlert::CHOICES
@@ -696,6 +700,27 @@ mod tests {
             .unwrap();
         let frame = render(&draft, settings(), selected, 24, None);
         assert!(frame.contains("gauges"), "{frame}");
+        for line in frame.trim_end_matches("\r\n").split("\r\n") {
+            assert!(line.chars().count() <= 70, "too wide: {line}");
+        }
+    }
+
+    #[test]
+    fn the_agent_order_cycles_through_all_three_choices_in_both_directions() {
+        let mut draft = settings();
+        draft.cycle(Row::Choice(Choice::Order), 1);
+        assert_eq!(draft.order, AgentOrder::Tabs);
+        draft.cycle(Row::Choice(Choice::Order), 1);
+        assert_eq!(draft.order, AgentOrder::Default);
+        draft.cycle(Row::Choice(Choice::Order), -1);
+        assert_eq!(draft.order, AgentOrder::Tabs);
+
+        let selected = rows()
+            .iter()
+            .position(|row| *row == Row::Choice(Choice::Order))
+            .unwrap();
+        let frame = render(&draft, settings(), selected, 24, None);
+        assert!(frame.contains("tabs"), "{frame}");
         for line in frame.trim_end_matches("\r\n").split("\r\n") {
             assert!(line.chars().count() <= 70, "too wide: {line}");
         }

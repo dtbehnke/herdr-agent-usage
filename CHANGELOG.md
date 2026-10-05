@@ -28,6 +28,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   percentage drawn against a denominator that does not exist would be invented,
   and the credit pool's own ratio degenerates to a constant 100% on a drained
   account while reading as "quota exhausted".
+- **`--agent-order tabs`.** Keeps Herdr's tab order inside each Space, but
+  draws every tab of one account together where the first of them sits, so a
+  shared row never splits because another agent's tab sits between two of its
+  members. Herdr's own order still nests only adjacent tabs. The new
+  "Toggle agent order" action (`prefix+shift+o`) switches between `quota` and
+  `tabs`, and from `default` it turns `quota` on. Herdr disables the clickable
+  sort label while a plugin view is active, so the toggle is a key, not a click.
 
 
 ### Changed
@@ -59,6 +66,25 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- A tab whose payer changes mid-session — an omp tab moving from its plan
+  model to the implementation provider, or back — regroups the tabs it leaves
+  in the same pass. The tab it left behind used to keep its head or child
+  styling until its own next event, which for an idle tab could be never.
+- An omp pane on one of several stored API keys for the same provider (two
+  OpenCode Go keys, say) shows the key pool instead of "quota account is not
+  confirmed": how many keys still have quota and when the next exhausted one
+  resets (`1/2 keys usable · next 3h10m`). omp's key reports carry no
+  identity, so the pane cannot be matched to its own key; the pool is what
+  can be proved. That line is a reason, not a window, so it never ranks the
+  pane or fires a low-quota alert. For OpenCode Go the pool counts only the
+  rolling (5h) and weekly windows omp ranks keys on: an exhausted monthly
+  allowance is display-only — it can still serve through the console's
+  balance fallback — so it neither benched a key nor delayed the next
+  comeback that was reported.
+- omp profiles no longer share a usage report or a refresh debounce. A pane
+  in one profile could show the only key of another profile's pool for the
+  same provider, and wait out that profile's debounce instead of asking its
+  own.
 - OpenCode tabs share a quota row only when they bill the same subscription.
   Every OpenCode tab in a Space used to join one row whatever backend it was
   talking to, so a pay-per-token tab (OpenCode Zen, Anthropic, …) could become

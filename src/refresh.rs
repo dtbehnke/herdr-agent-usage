@@ -429,7 +429,7 @@ fn run_internal(
 /// respawns the watcher. Event/focus/watch ticks stay off this path.
 fn restore_quota_agent_view(cache: &CacheStore) {
     let order = crate::configure::resolved_agent_order(None, Some(cache));
-    if order.is_quota() {
+    if order.owns_view() {
         crate::configure::apply_agent_order(order);
     }
 }
@@ -558,6 +558,10 @@ fn relayout(seed: Option<String>) -> Result<()> {
 
 fn stale_layout_workspaces(panes: &[AgentPane], order: PanelOrder) -> BTreeSet<String> {
     let groups = QuotaGroups::new(panes, order, &PayerEvidence::from_cache());
+    // The tabs view sorts by tab position, which a close, move, or new tab
+    // shifts without changing any group. Headroom-keyed stacks move only with
+    // quota, so the quota view never needs this check.
+    let positions = (order == PanelOrder::Tabs).then(|| vendor_stack_keys(panes, &[], order));
     let mut headers = BTreeMap::<&str, usize>::new();
     for pane in panes {
         if pane
@@ -571,17 +575,16 @@ fn stale_layout_workspaces(panes: &[AgentPane], order: PanelOrder) -> BTreeSet<S
     panes
         .iter()
         .filter(|pane| {
-            let misnested = match groups.head(&pane.pane_id) {
-                Some(head) => pane_needs_vendor_restyle(pane, &groups, head == pane.pane_id),
-                // A pane that shares no row, such as a Claude tab whose
-                // sibling turned out to be another login, must not keep a
-                // head's or a child's styling.
-                None => pane_keeps_nested_styling(pane),
-            };
+            let misnested = pane_misnested(pane, &groups);
             let misheaded = !pane.workspace_id.is_empty()
                 && plugin_quota_present(&pane.tokens)
                 && headers.get(pane.workspace_id.as_str()) != Some(&1);
-            misnested || misheaded
+            let misplaced = positions.as_ref().is_some_and(|stack| {
+                pane.tokens
+                    .get(STACK_TOKEN)
+                    .is_some_and(|published| stack.get(&pane.pane_id) != Some(published))
+            });
+            misnested || misheaded || misplaced
         })
         .map(|pane| pane.workspace_id.clone())
         .collect()
@@ -785,7 +788,7 @@ fn handle_named_pane(
     // what makes the alert land at the end of the turn that spent the quota
     // rather than at the next poll.
     notify_low_quota(cache, &tokens);
-    sync_vendor_row_siblings(&mut tokens, &mut panes);
+    sync_vendor_row_siblings(cache, row, &mut tokens, &mut panes)?;
     // Completion colour must land even if this pane is scrolled: the scroll
     // guard exists to protect reading transcript, not to leave a stale glyph.
     publish_status_icons(&panes, &tokens, CacheStore::now_millis(), row)
@@ -1065,8 +1068,12 @@ fn omp_quota_with_refresh(
                 .cloned()
         });
     let unavailable = || {
+        let reason = report
+            .as_ref()
+            .and_then(|usage| omp_pool_reason(usage, evidence, now))
+            .unwrap_or_else(|| "quota account is not confirmed".to_string());
         Some(PaneQuotaUpdate::Replace(Box::new(
-            MetadataTokens::unavailable(target.billing, "quota account is not confirmed"),
+            MetadataTokens::unavailable(target.billing, reason),
         )))
     };
     let debounced = cache
@@ -1088,6 +1095,9 @@ fn omp_quota_with_refresh(
         // at all, so any subscription numbers still on the pane belong to a
         // login that is not paying for it.
         OmpUsage::PayAsYouGo => Some(PaneQuotaUpdate::Clear),
+        OmpUsage::Pool(summary) => Some(PaneQuotaUpdate::Replace(Box::new(
+            MetadataTokens::unavailable(target.billing, summary),
+        ))),
         OmpUsage::Unavailable if cached.is_none() => Some(PaneQuotaUpdate::Replace(Box::new(
             MetadataTokens::unavailable(target.billing, "omp reported no quota data"),
         ))),
@@ -1101,10 +1111,52 @@ fn omp_quota_with_refresh(
     }
 }
 
+/// The key pool's state, for a pane a stored key served when omp reports
+/// several keys and nothing that says which one is this pane's.
+///
+/// Only a stored key is one of the pool's keys. A pinned OAuth login is not,
+/// and an unstamped reply was served by a runtime, config, or environment key
+/// the pool says nothing about.
+fn omp_pool_reason(
+    usage: &omp_provider::ProviderUsage,
+    evidence: &OmpEvidence,
+    now: u64,
+) -> Option<String> {
+    if evidence.account_pin.is_some() || evidence.credential_id.is_none() {
+        return None;
+    }
+    omp_provider::pool_summary(usage, &evidence.provider_id, now)
+}
+
+/// What a fresh report says about a pane none of its accounts is proved to be.
+fn omp_unattributed(
+    usage: &omp_provider::ProviderUsage,
+    evidence: &OmpEvidence,
+    now: u64,
+) -> OmpUsage {
+    // Before the OAuth check: a key pane is not the OAuth login omp could not
+    // fetch, and the debounce path must publish the same reason.
+    if let Some(summary) = omp_pool_reason(usage, evidence, now) {
+        return OmpUsage::Pool(summary);
+    }
+    if omp_provider::oauth_without_usage_matches(usage, evidence.account_pin.as_deref()) {
+        return OmpUsage::Unavailable;
+    }
+    // Several accounts and no pin is not a coin flip either: only a provider
+    // that has an API key and nothing else is proved to be pay-as-you-go.
+    if usage.accounts.is_empty() && usage.oauth_without_usage_pins.is_empty() && usage.has_api_key {
+        OmpUsage::PayAsYouGo
+    } else {
+        OmpUsage::Unknown
+    }
+}
+
 /// What one `omp usage --json` call established about a pane's provider.
 enum OmpUsage {
     Account(Box<ProviderSnapshot>),
     PayAsYouGo,
+    /// Several credentials, none attributable to this pane: the pool's state.
+    Pool(String),
     Unavailable,
     Unknown,
 }
@@ -1138,20 +1190,7 @@ fn refresh_omp_target(
     }
     let Some(account) = omp_provider::select_account(&usage, evidence.account_pin.as_deref())
     else {
-        if omp_provider::oauth_without_usage_matches(&usage, evidence.account_pin.as_deref()) {
-            return OmpUsage::Unavailable;
-        }
-        // Several accounts and no pin is not a coin flip either: only a
-        // provider that has an API key and nothing else is proved to be
-        // pay-as-you-go.
-        return if usage.accounts.is_empty()
-            && usage.oauth_without_usage_pins.is_empty()
-            && usage.has_api_key
-        {
-            OmpUsage::PayAsYouGo
-        } else {
-            OmpUsage::Unknown
-        };
+        return omp_unattributed(&usage, evidence, now);
     };
     let snapshot = omp_provider::snapshot(target, account);
     if cache.save_target(target, &snapshot).is_err() {
@@ -1618,7 +1657,7 @@ fn publish_resolved(
     }
     notify_low_quota(cache, &tokens);
     let mut publish_panes = panes.to_vec();
-    sync_vendor_row_siblings(&mut tokens, &mut publish_panes);
+    sync_vendor_row_siblings(cache, row, &mut tokens, &mut publish_panes)?;
     if allow_icon_while_scrolled {
         publish_pane_tokens_with_scrolled_icons(
             &publish_panes,
@@ -1656,9 +1695,33 @@ fn panes_for_vendor_rows(live: &[AgentPane]) -> Vec<AgentPane> {
 /// Mark the current pass, then republish same-Space extras whose account
 /// windows still disagree with the representative. An event that only names
 /// one Grok would otherwise leave a sibling showing duplicate 5h/7d/30d.
-fn sync_vendor_row_siblings(tokens: &mut Vec<PaneTokens>, panes: &mut Vec<AgentPane>) {
+///
+/// A pane whose payer changed (an omp tab moving from its plan model to the
+/// implementation provider, or back) leaves its old group in this pass. The
+/// panes it left behind are resolved here too, so they lose their nested
+/// styling now rather than at their own next event.
+fn sync_vendor_row_siblings(
+    cache: &CacheStore,
+    row: RowStyle,
+    tokens: &mut Vec<PaneTokens>,
+    panes: &mut Vec<AgentPane>,
+) -> Result<()> {
     let inventory = panes_for_vendor_rows(panes);
     let order = crate::herdr::panel_order();
+    let enabled = AgentSelection::from_args_or_env(&[]);
+    let now = CacheStore::now_unix();
+    for mut pane in left_behind_panes(&inventory, panes, order) {
+        if !enabled.contains(&pane.harness) {
+            continue;
+        }
+        let resolved = route::resolve_with_identity(&pane);
+        let Some(pane_tokens) = resolved_pane_tokens(cache, &mut pane, resolved, now, row, false)?
+        else {
+            continue;
+        };
+        panes.push(pane);
+        tokens.push(pane_tokens);
+    }
     mark_one_quota_row_per_vendor(tokens, &inventory, order);
     for extra in vendor_row_sync_extras(tokens, &inventory, order) {
         if let Some(pane) = inventory
@@ -1669,6 +1732,55 @@ fn sync_vendor_row_siblings(tokens: &mut Vec<PaneTokens>, panes: &mut Vec<AgentP
             panes.push(pane);
             tokens.push(extra);
         }
+    }
+    Ok(())
+}
+
+/// Panes in this pass's Spaces whose published styling no longer matches
+/// their group, and which this pass would not otherwise write.
+///
+/// The same test a layout pass applies, scoped to the Spaces the pass already
+/// touches, so a turn adds no inventory read and no write to a steady pane.
+fn left_behind_panes(
+    inventory: &[AgentPane],
+    publishing: &[AgentPane],
+    order: PanelOrder,
+) -> Vec<AgentPane> {
+    let groups = QuotaGroups::new(inventory, order, &PayerEvidence::from_cache());
+    let spaces = publishing
+        .iter()
+        .map(|pane| pane.workspace_id.as_str())
+        .collect::<BTreeSet<_>>();
+    let published = publishing
+        .iter()
+        .map(|pane| pane.pane_id.as_str())
+        .collect::<BTreeSet<_>>();
+    // A live group's other members are `vendor_row_sync_extras`' to restyle.
+    let live_groups = publishing
+        .iter()
+        .filter_map(|pane| groups.key(&pane.pane_id))
+        .collect::<BTreeSet<_>>();
+    inventory
+        .iter()
+        .filter(|pane| {
+            !published.contains(pane.pane_id.as_str())
+                && spaces.contains(pane.workspace_id.as_str())
+                && groups
+                    .key(&pane.pane_id)
+                    .is_none_or(|key| !live_groups.contains(key))
+                && pane_misnested(pane, &groups)
+        })
+        .cloned()
+        .collect()
+}
+
+/// Whether a pane's published styling disagrees with its group role.
+fn pane_misnested(pane: &AgentPane, groups: &QuotaGroups) -> bool {
+    match groups.head(&pane.pane_id) {
+        Some(head) => pane_needs_vendor_restyle(pane, groups, head == pane.pane_id),
+        // A pane that shares no row, such as a Claude tab whose sibling turned
+        // out to be another login, must not keep a head's or a child's styling.
+        None => pane_keeps_nested_styling(pane),
     }
 }
 
@@ -2881,7 +2993,7 @@ mod tests {
     fn omp_panes_keep_both_accounts_from_one_debounced_report() {
         let dir = tempdir().unwrap();
         let cache = CacheStore::new(dir.path());
-        let target = BillingTarget::omp("anthropic");
+        let target = BillingTarget::omp(std::path::Path::new(".omp/agent"), "anthropic");
         let mut usage = omp_provider::ProviderUsage::default();
         for (pin, used) in [("a", 20.0), ("b", 80.0)] {
             usage.accounts.push(omp_provider::AccountUsage {
@@ -2920,6 +3032,128 @@ mod tests {
                 matches!(update, Some(PaneQuotaUpdate::Replace(values)) if values.quota_week == expected)
             );
         }
+    }
+
+    /// Two omp profiles on one provider are two credential pools. A row id
+    /// is only meaningful in the pool that reported it, so a profile never
+    /// reads another's report and never waits out another's debounce.
+    #[test]
+    fn omp_profiles_on_one_provider_never_share_a_report_or_a_debounce() {
+        let dir = tempdir().unwrap();
+        let cache = CacheStore::new(dir.path());
+        let evidence = |agent_dir: &str, credential: Option<&str>| OmpEvidence {
+            paths: crate::omp::OmpPaths {
+                agent_dir: dir.path().join(agent_dir),
+                sessions: dir.path().join(agent_dir).join("sessions"),
+            },
+            provider_id: "opencode-go".to_string(),
+            account_pin: None,
+            credential_id: credential.map(str::to_string),
+        };
+        let key = |used: f64| omp_provider::AccountUsage {
+            pin: None,
+            windows: vec![UsageWindow::new(WindowKind::Weekly, used, None).unwrap()],
+            fetched_at_unix: 100,
+        };
+        // The plan profile has one OpenCode Go key, the pool profile two.
+        for (agent_dir, accounts) in [
+            (".omp/profiles/plan/agent", vec![key(10.0)]),
+            (".omp/profiles/pool/agent", vec![key(10.0), key(100.0)]),
+        ] {
+            let target = BillingTarget::omp(&dir.path().join(agent_dir), "opencode-go");
+            let usage = omp_provider::ProviderUsage {
+                accounts,
+                ..Default::default()
+            };
+            cache.save_omp_usage(&target, &usage).unwrap();
+            cache.mark_refresh_target(&target, 100).unwrap();
+        }
+        let quota = |evidence: &OmpEvidence, refresh: &dyn Fn() -> OmpUsage| {
+            let target = BillingTarget::omp(&evidence.paths.agent_dir, "opencode-go");
+            match omp_quota_with_refresh(
+                &cache,
+                &target,
+                evidence,
+                110,
+                RowStyle::default(),
+                false,
+                |_, _, _, _| refresh(),
+            ) {
+                Some(PaneQuotaUpdate::Replace(values)) => values,
+                _ => panic!("expected replacement"),
+            }
+        };
+
+        // Within the debounce, a profile with one key reads that key.
+        let debounced = || panic!("debounced refresh must not run");
+        let plan = evidence(".omp/profiles/plan/agent", Some("3"));
+        assert_eq!(quota(&plan, &debounced).quota_week, "7d 90%");
+        // Several keys and nothing naming this pane's: the pool, never a
+        // guess, and never a window that could rank the pane.
+        let pooled = quota(&evidence(".omp/profiles/pool/agent", Some("3")), &debounced);
+        assert_eq!(pooled.quota_week, "");
+        assert_eq!(pooled.quota_headroom, None);
+        assert_eq!(pooled.quota_error.as_deref(), Some("1/2 keys usable"));
+        // An unstamped reply came from a key outside the pool, and a pinned
+        // OAuth login is not one of its keys.
+        let unstamped = quota(&evidence(".omp/profiles/pool/agent", None), &debounced);
+        let mut pinned = evidence(".omp/profiles/pool/agent", Some("3"));
+        pinned.account_pin = Some("oauth-pin".to_string());
+        for values in [unstamped, quota(&pinned, &debounced)] {
+            assert_eq!(values.quota_week, "");
+            assert_eq!(
+                values.quota_error.as_deref(),
+                Some("quota account is not confirmed")
+            );
+        }
+
+        // Another profile's credential 3 is another key: it refreshes for
+        // itself and does not borrow the plan profile's only key.
+        let ran = std::cell::Cell::new(false);
+        let impl_pane = evidence(".omp/profiles/impl/agent", Some("3"));
+        let values = quota(&impl_pane, &|| {
+            ran.set(true);
+            OmpUsage::Unknown
+        });
+        assert!(ran.get(), "another profile's debounce must not apply");
+        assert_eq!(values.quota_week, "");
+    }
+
+    /// A fresh report and the debounced one must say the same thing about a
+    /// key pane, or every refresh rewrites its row. An OAuth login omp could
+    /// not fetch is not this pane, so it does not turn the pool into
+    /// "no quota data".
+    #[test]
+    fn a_key_pane_reads_the_pool_before_an_unrelated_oauth_failure() {
+        let key = |used: f64| omp_provider::AccountUsage {
+            pin: None,
+            windows: vec![UsageWindow::new(WindowKind::Weekly, used, None).unwrap()],
+            fetched_at_unix: 100,
+        };
+        let usage = omp_provider::ProviderUsage {
+            accounts: vec![key(10.0), key(100.0)],
+            has_api_key: false,
+            oauth_without_usage_pins: vec![Some("oauth-pin".to_string())],
+        };
+        let mut evidence = OmpEvidence {
+            paths: crate::omp::OmpPaths {
+                agent_dir: ".omp/agent".into(),
+                sessions: ".omp/agent/sessions".into(),
+            },
+            provider_id: "opencode-go".to_string(),
+            account_pin: None,
+            credential_id: Some("3".to_string()),
+        };
+        assert!(matches!(
+            omp_unattributed(&usage, &evidence, 110),
+            OmpUsage::Pool(summary) if summary == "1/2 keys usable"
+        ));
+        // The OAuth login itself still reads as omp's explicit failure.
+        evidence.account_pin = Some("oauth-pin".to_string());
+        assert!(matches!(
+            omp_unattributed(&usage, &evidence, 110),
+            OmpUsage::Unavailable
+        ));
     }
 
     #[test]
@@ -3335,6 +3569,66 @@ mod tests {
         );
     }
 
+    /// A tab whose payer changed this turn (here: no longer a Grok) leaves its
+    /// old group in the same pass. The head it left behind is now alone and
+    /// must drop its shared rows now, not at its own next event; a steady pane
+    /// and a pane in another Space are not written.
+    #[test]
+    fn a_head_left_alone_by_a_payer_change_is_restyled_in_the_same_pass() {
+        let head = published_pane("w1:p1", "w1", Harness::Grok, &NESTED_HEAD);
+        let leaver = published_pane("w1:p2", "w1", Harness::Claude, &FLAT_CLAUDE[1..]);
+        let steady = published_pane("w1:p3", "w1", Harness::Claude, &FLAT_CLAUDE[1..]);
+        let elsewhere = published_pane("w2:p1", "w2", Harness::Grok, &NESTED_HEAD);
+        let inventory = [head, leaver.clone(), steady, elsewhere];
+        let left = left_behind_panes(&inventory, &[leaver], PanelOrder::Quota);
+        assert_eq!(
+            left.iter()
+                .map(|pane| pane.pane_id.as_str())
+                .collect::<Vec<_>>(),
+            ["w1:p1"]
+        );
+    }
+
+    /// The tabs view sorts by tab position. A tab that moves shifts the keys
+    /// of the panes around it without changing any group, and that alone has
+    /// to be republished.
+    #[test]
+    fn a_tab_move_under_the_tabs_order_needs_a_layout_pass() {
+        let with_stack = |tokens: &[(&'static str, &'static str)], stack: &'static str| {
+            let mut tokens = tokens.to_vec();
+            tokens.push((STACK_TOKEN, stack));
+            tokens
+        };
+        let flat = published_pane(
+            "w1:p0",
+            "w1",
+            Harness::Claude,
+            &with_stack(&FLAT_CLAUDE[1..], "0000000"),
+        );
+        let head = published_pane(
+            "w1:p1",
+            "w1",
+            Harness::Grok,
+            &with_stack(&NESTED_HEAD, "0010001"),
+        );
+        let child = published_pane(
+            "w1:p2",
+            "w1",
+            Harness::Grok,
+            &with_stack(&[("quota_model", "grok-4")], "0011002"),
+        );
+        let steady = [flat.clone(), head.clone(), child.clone()];
+        assert!(stale_layout_workspaces(&steady, PanelOrder::Tabs).is_empty());
+
+        let moved = [head, child, flat];
+        assert_eq!(
+            stale_layout_workspaces(&moved, PanelOrder::Tabs),
+            BTreeSet::from(["w1".to_string()])
+        );
+        // The quota view keys on headroom, so a move alone is not stale there.
+        assert!(stale_layout_workspaces(&moved, PanelOrder::Quota).is_empty());
+    }
+
     #[test]
     fn a_space_whose_header_pane_left_needs_a_layout_pass() {
         let survivor = published_pane(
@@ -3558,7 +3852,7 @@ mod tests {
     fn an_omp_oauth_account_without_usage_is_explicit_on_the_first_fetch() {
         let directory = tempdir().unwrap();
         let cache = CacheStore::new(directory.path());
-        let target = BillingTarget::omp("anthropic");
+        let target = BillingTarget::omp(std::path::Path::new(".omp/agent"), "anthropic");
         let evidence = crate::omp::OmpEvidence {
             paths: crate::omp::OmpPaths {
                 agent_dir: directory.path().join(".omp/agent"),
@@ -3592,7 +3886,7 @@ mod tests {
     fn an_omp_failed_first_fetch_is_debounced_without_a_snapshot() {
         let directory = tempdir().unwrap();
         let cache = CacheStore::new(directory.path());
-        let target = BillingTarget::omp("anthropic");
+        let target = BillingTarget::omp(std::path::Path::new(".omp/agent"), "anthropic");
         cache.mark_refresh_target(&target, 100).unwrap();
         let evidence = crate::omp::OmpEvidence {
             paths: crate::omp::OmpPaths {
@@ -3621,7 +3915,7 @@ mod tests {
     fn an_expired_omp_window_bypasses_the_fetch_debounce() {
         let directory = tempdir().unwrap();
         let cache = CacheStore::new(directory.path());
-        let target = BillingTarget::omp("anthropic");
+        let target = BillingTarget::omp(std::path::Path::new(".omp/agent"), "anthropic");
         cache
             .save_target(
                 &target,
@@ -3676,7 +3970,7 @@ mod tests {
     fn an_omp_usage_failure_keeps_the_same_accounts_last_good_snapshot() {
         let directory = tempdir().unwrap();
         let cache = CacheStore::new(directory.path());
-        let target = BillingTarget::omp("anthropic");
+        let target = BillingTarget::omp(std::path::Path::new(".omp/agent"), "anthropic");
         let snapshot = ProviderSnapshot::new(
             Provider::Claude,
             vec![UsageWindow::new(WindowKind::Weekly, 42.0, None).unwrap()],

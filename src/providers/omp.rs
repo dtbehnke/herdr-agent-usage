@@ -423,6 +423,87 @@ pub fn oauth_without_usage_matches(usage: &ProviderUsage, pin: Option<&str>) -> 
     usage.oauth_without_usage_pins.len() == 1
 }
 
+/// The key pool's state, for a pane omp cannot attribute to one key.
+///
+/// API keys report no identity, so with several of them a pane cannot be
+/// matched to its own report. What is still provable is the pool: how many
+/// keys omp can rotate to, and when the next exhausted one comes back. It is a
+/// reason line, never a window, so it cannot rank the pane or fire an alert.
+///
+/// Only reported keys count. omp does not list a key whose usage fetch failed
+/// while another key of the provider reported, so it cannot be counted.
+///
+/// `provider_id` is omp's own id for the provider the pane talks to: whether an
+/// exhausted window benches a key is a property of that provider's ranking, not
+/// of the report.
+pub fn pool_summary(usage: &ProviderUsage, provider_id: &str, now_unix: u64) -> Option<String> {
+    // A report with a pin is an OAuth login, not one of the keys.
+    let keys: Vec<_> = usage
+        .accounts
+        .iter()
+        .filter(|account| account.pin.is_none())
+        .collect();
+    if keys.len() < 2 {
+        return None;
+    }
+    let mut usable = 0;
+    let mut next: Option<u64> = None;
+    let mut every_reset_known = true;
+    for account in &keys {
+        let exhausted: Vec<_> = account
+            .windows
+            .iter()
+            .filter(|window| {
+                window.remaining_percent <= 0.0
+                    && window.is_current(now_unix)
+                    && window_benches_key(provider_id, window.kind)
+            })
+            .collect();
+        if exhausted.is_empty() {
+            usable += 1;
+            continue;
+        }
+        // A key is back only once every window it exhausted has reset.
+        let back = exhausted
+            .iter()
+            .map(|window| window.resets_at.map(ResetAt::unix_seconds))
+            .collect::<Option<Vec<_>>>()
+            .and_then(|resets| resets.into_iter().max());
+        match back {
+            Some(back) => next = Some(next.map_or(back, |next| next.min(back))),
+            None => every_reset_known = false,
+        }
+    }
+    let mut summary = format!("{usable}/{} keys usable", keys.len());
+    // An exhausted key with no reset could come back first, so a partial
+    // answer is no answer.
+    if let (true, Some(next)) = (every_reset_known, next) {
+        summary.push_str(" · next ");
+        summary.push_str(&crate::presentation::format_reset_eta(
+            ResetAt::from_unix_seconds(next),
+            now_unix,
+        ));
+    }
+    Some(summary)
+}
+
+/// Whether an exhausted window benches a key in omp's own ranking.
+///
+/// omp ranks a multi-key pool by the provider's blocking windows, not by every
+/// window it displays. OpenCode Go's monthly window is display-only: an
+/// exhausted monthly can still serve requests through the account's console
+/// "Use balance" setting, and the usage endpoint does not report whether that
+/// fallback is on, so `opencodeGoRankingStrategy.scopeLimits` keeps only the
+/// rolling (5h) and weekly limits. Counting the monthly window here would bench
+/// a working key until its subscription anniversary. Every other provider keeps
+/// all the windows omp reports for it.
+fn window_benches_key(provider_id: &str, kind: WindowKind) -> bool {
+    match provider_id {
+        "opencode-go" => kind != WindowKind::Monthly,
+        _ => true,
+    }
+}
+
 pub fn snapshot(target: &BillingTarget, account: &AccountUsage) -> ProviderSnapshot {
     let mut snapshot = ProviderSnapshot::new(
         target.billing,
@@ -601,6 +682,159 @@ mod tests {
         // Two accounts and no pin is not a coin flip.
         assert_eq!(select_account(&usage, None), None);
         assert_eq!(select_account(&usage, Some("third")), None);
+    }
+
+    /// An OpenCode Go key report as omp writes it: no identity at all, only
+    /// the plan name and endpoint.
+    fn key_report(used: f64, resets_ms: Option<u64>) -> Value {
+        key_report_with_windows(&[("5h", Some(18_000_000), used, resets_ms)])
+    }
+
+    /// An OpenCode Go key report carrying several limits: the rolling (5h) and
+    /// weekly (7d) windows with durations, and the monthly anniversary window,
+    /// which deliberately carries none (omp's own descriptor).
+    fn key_report_with_windows(windows: &[(&str, Option<u64>, f64, Option<u64>)]) -> Value {
+        let limits: Vec<Value> = windows
+            .iter()
+            .map(|(id, duration_ms, used, resets_ms)| {
+                let mut window = json!({"id": id});
+                if let Some(duration_ms) = duration_ms {
+                    window["durationMs"] = json!(duration_ms);
+                }
+                if let Some(resets_ms) = resets_ms {
+                    window["resetsAt"] = json!(resets_ms);
+                }
+                json!({"id": id, "window": window, "amount": {"usedFraction": used}})
+            })
+            .collect();
+        json!({
+            "provider": "opencode-go",
+            "metadata": {"planType": "OpenCode Go", "endpoint": "https://opencode.ai/zen/go/v1/usage"},
+            "limits": limits
+        })
+    }
+
+    /// Nothing in either report says which key serves the pane.
+    #[test]
+    fn two_api_keys_stay_unattributed() {
+        let value = json!({"reports": [key_report(0.1, None), key_report(0.9, None)]});
+        let usage = parse_usage(&value, "opencode-go", 0);
+        assert_eq!(usage.accounts.len(), 2);
+        assert_eq!(select_account(&usage, None), None);
+    }
+
+    #[test]
+    fn the_pool_summary_counts_usable_keys_and_the_next_comeback() {
+        let now = 1_000;
+        let value = json!({"reports": [
+            key_report(0.2, Some(5_000_000)),
+            key_report(1.0, Some(4_600_000)),
+            key_report(1.0, Some(8_200_000)),
+            // Exhausted, but its window reset already: usable again.
+            key_report(1.0, Some(900_000)),
+        ]});
+        let usage = parse_usage(&value, "opencode-go", now);
+        assert_eq!(
+            pool_summary(&usage, "opencode-go", now).as_deref(),
+            Some("2/4 keys usable · next 1h00m")
+        );
+        // An exhausted key with no reset could come back first.
+        let value = json!({"reports": [
+            key_report(1.0, Some(4_600_000)),
+            key_report(1.0, None),
+        ]});
+        assert_eq!(
+            pool_summary(&parse_usage(&value, "opencode-go", now), "opencode-go", now).as_deref(),
+            Some("0/2 keys usable")
+        );
+        // One key is attributable on its own; no summary.
+        let value = json!({"reports": [key_report(1.0, None)]});
+        assert_eq!(
+            pool_summary(&parse_usage(&value, "opencode-go", now), "opencode-go", now),
+            None
+        );
+        // An OAuth login beside one key is not a second key.
+        let mut usage = parse_usage(&value, "opencode-go", now);
+        usage.accounts.push(AccountUsage {
+            pin: Some("oauth".to_string()),
+            windows: vec![],
+            fetched_at_unix: now,
+        });
+        assert_eq!(pool_summary(&usage, "opencode-go", now), None);
+    }
+
+    /// omp ranks an OpenCode Go pool by the rolling and weekly windows alone,
+    /// so an exhausted monthly window does not make a key unusable.
+    #[test]
+    fn an_exhausted_opencode_go_monthly_window_keeps_the_key_usable() {
+        let now = 1_000;
+        let value = json!({"reports": [
+            key_report_with_windows(&[
+                ("5h", Some(18_000_000), 0.1, Some(4_600_000)),
+                ("7d", Some(604_800_000), 0.1, Some(8_200_000)),
+                ("monthly", None, 1.0, Some(90_000_000)),
+            ]),
+            key_report_with_windows(&[
+                ("5h", Some(18_000_000), 0.1, Some(4_600_000)),
+                ("7d", Some(604_800_000), 0.1, Some(8_200_000)),
+                ("monthly", None, 1.0, Some(90_000_000)),
+            ]),
+        ]});
+        let usage = parse_usage(&value, "opencode-go", now);
+        assert_eq!(
+            pool_summary(&usage, "opencode-go", now).as_deref(),
+            Some("2/2 keys usable")
+        );
+    }
+
+    /// The monthly reset must not delay the comeback of a key that also
+    /// exhausted its rolling and weekly windows.
+    #[test]
+    fn an_opencode_go_monthly_reset_does_not_delay_the_next_comeback() {
+        let now = 1_000;
+        let value = json!({"reports": [
+            key_report_with_windows(&[
+                ("5h", Some(18_000_000), 1.0, Some(4_600_000)),
+                ("7d", Some(604_800_000), 1.0, Some(8_200_000)),
+                ("monthly", None, 1.0, Some(90_000_000)),
+            ]),
+            key_report_with_windows(&[
+                ("5h", Some(18_000_000), 0.1, Some(4_600_000)),
+                ("7d", Some(604_800_000), 0.1, Some(8_200_000)),
+                ("monthly", None, 1.0, Some(90_000_000)),
+            ]),
+        ]});
+        let usage = parse_usage(&value, "opencode-go", now);
+        assert_eq!(
+            pool_summary(&usage, "opencode-go", now).as_deref(),
+            Some("1/2 keys usable · next 2h00m")
+        );
+    }
+
+    /// Only OpenCode Go scopes the monthly window out; every other provider
+    /// keeps all the windows omp reports for it.
+    #[test]
+    fn a_monthly_window_still_benches_a_key_for_other_providers() {
+        let now = 1_000;
+        let monthly = || AccountUsage {
+            pin: None,
+            windows: vec![UsageWindow::new(
+                WindowKind::Monthly,
+                100.0,
+                Some(ResetAt::from_unix_seconds(90_000)),
+            )
+            .expect("monthly window")],
+            fetched_at_unix: now,
+        };
+        let usage = ProviderUsage {
+            accounts: vec![monthly(), monthly()],
+            has_api_key: true,
+            oauth_without_usage_pins: vec![],
+        };
+        assert_eq!(
+            pool_summary(&usage, "anthropic", now).as_deref(),
+            Some("0/2 keys usable · next 1d0h")
+        );
     }
 
     /// The whole subprocess path, against a stub that records how it was

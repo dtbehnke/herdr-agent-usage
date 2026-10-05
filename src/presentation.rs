@@ -806,7 +806,7 @@ fn leading_eta_unit(eta: &str) -> Option<&str> {
     None
 }
 
-fn format_reset_eta(reset_at: ResetAt, now_unix: u64) -> String {
+pub(crate) fn format_reset_eta(reset_at: ResetAt, now_unix: u64) -> String {
     let seconds = reset_at.unix_seconds().saturating_sub(now_unix);
     if seconds == 0 {
         return "due".to_string();

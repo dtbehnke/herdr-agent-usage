@@ -353,7 +353,10 @@ mod tests {
         let resolved = resolve_with_identity(&omp_pane(&path));
         assert_eq!(
             resolved.resolution,
-            Resolution::Subscription(BillingTarget::omp("anthropic"))
+            Resolution::Subscription(BillingTarget::omp(
+                &dir.path().join(".omp/agent"),
+                "anthropic"
+            ))
         );
         let identity = resolved.identity.expect("identity");
         assert_eq!(identity.provider, "Claude");
@@ -404,7 +407,10 @@ mod tests {
         let resolved = resolve_with_identity(&omp_pane(&path));
         assert_eq!(
             resolved.resolution,
-            Resolution::Subscription(BillingTarget::omp("xai-oauth"))
+            Resolution::Subscription(BillingTarget::omp(
+                &dir.path().join(".omp/agent"),
+                "xai-oauth"
+            ))
         );
         let identity = resolved.identity.expect("identity");
         assert_eq!(identity.provider, "Grok");
@@ -555,7 +561,10 @@ mod tests {
         for resolved in [&first, &second] {
             assert_eq!(
                 resolved.resolution,
-                Resolution::Subscription(BillingTarget::omp("anthropic"))
+                Resolution::Subscription(BillingTarget::omp(
+                    &dir.path().join(".omp/agent"),
+                    "anthropic"
+                ))
             );
         }
         assert_eq!(first.identity.expect("identity").model, "model-a");
@@ -579,7 +588,10 @@ mod tests {
         let resolved = resolve_omp_with_identity(Some(&path));
         assert_eq!(
             resolved.resolution,
-            Resolution::Subscription(BillingTarget::omp("openrouter"))
+            Resolution::Subscription(BillingTarget::omp(
+                &dir.path().join(".omp/agent"),
+                "openrouter"
+            ))
         );
         assert_eq!(
             resolved.identity.map(|identity| identity.provider),
@@ -602,11 +614,18 @@ mod tests {
     /// snapshot, or a Pro seat in omp would display the Max seat's quota.
     #[test]
     fn an_omp_target_caches_apart_from_the_canonical_collector() {
-        let omp = BillingTarget::omp("anthropic");
-        let antigravity = BillingTarget::omp("google-antigravity");
+        let agent_dir = std::path::Path::new("/home/u/.omp/agent");
+        let omp = BillingTarget::omp(agent_dir, "anthropic");
+        let antigravity = BillingTarget::omp(agent_dir, "google-antigravity");
         let canonical = BillingTarget::original_four(Provider::Claude);
         assert_ne!(omp.cache_identity(), canonical.cache_identity());
         assert_ne!(omp.cache_identity(), antigravity.cache_identity());
+        // Each omp profile is its own credential pool.
+        let profile = BillingTarget::omp(
+            std::path::Path::new("/home/u/.omp/profiles/work/agent"),
+            "anthropic",
+        );
+        assert_ne!(omp.cache_identity(), profile.cache_identity());
         assert!(!antigravity.cache_identity().contains("google-antigravity"));
         assert_eq!(omp.credential_scope, CredentialScope::OMP_STORE);
         assert_eq!(omp.original_provider(), None);

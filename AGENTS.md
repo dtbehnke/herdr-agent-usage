@@ -114,7 +114,9 @@ Three properties hold that together, and each one is load bearing:
 An omp pane is billed in `CredentialScope::OMP_STORE`, not the canonical scope.
 An omp Claude pane and a Claude Code pane can be two different subscriptions,
 so they must never share a cache file; `BillingTarget::cache_identity` is what
-keeps them apart, and it is the reason that function appends a scope.
+keeps them apart, and it is the reason that function appends a scope. The omp
+target is also scoped by agent directory: every profile is its own credential
+pool, so two profiles never share a usage report or a debounce marker.
 
 Attribution is by omp's `credential_pin`: the transcript records
 `sha256(provider\0accountId\0email\0orgId\0projectId)` of the serving
@@ -123,6 +125,19 @@ report's identity. That digest is omp's persisted contract — if it changes
 upstream, every pin is orphaned and multi-account panes silently fall back to
 "no quota". The pinned-digest test exists to make that a test failure rather
 than a wrong number.
+
+An API key has no identity, so it has no pin, and omp's key reports (OpenCode
+Go: only `planType` and `endpoint`) carry nothing that names the key. With
+several keys a pane cannot be matched to its report. A pane a stored key
+served (the reply's `credentialId` set, no pin) then publishes
+`providers::omp::pool_summary` as `quota_error` (usable keys, next reset),
+never a window, so the pool cannot rank a pane or fire an alert. An unstamped
+reply came from a runtime or environment key outside the pool, and a pinned
+login is not one of its keys: both keep "not confirmed". The gate is
+`refresh::omp_pool_reason`, checked before the OAuth-failure match and shared
+by the refresh and debounce paths so both publish the same reason. omp lists
+an API key under `accountsWithoutUsage` only when its provider has no report
+at all, so a failed key beside a working one is invisible and not counted.
 
 ## Quota attribution and cache upgrades
 
@@ -144,7 +159,9 @@ than a wrong number.
 - Sidebar row sharing goes through `herdr::QuotaGroups`, built from Herdr's
   inventory order. Under Herdr's own agent order only a run of adjacent panes
   is one group, and its first pane is the head. Do not derive group
-  membership from `nest_group_key` alone.
+  membership from `nest_group_key` alone. Under either plugin view
+  (`quota`, `tabs`) every same-payer pane in a Space is one group; the tabs
+  view heads it with the first pane in inventory order.
 - Agy must identify the active pool or receive only one possible pool. Do not
   combine Gemini and third-party quotas for an unknown model.
 - OMP stores all accounts in one sanitized provider report so a second pin
@@ -342,14 +359,21 @@ one, and setting it replaces the user's own `ui.agent_panel_sort`. Rules:
    Herdr drops a plugin-owned view on disable; enable does not run startup.
    The refresh action (`--force`) is the same repair that respawns the
    watcher. Event/focus/watch stay off this path so a turn does not spend a
-   socket call.
+   socket call. The toggle action (`toggle-order`) republishes under the new
+   order first, then sets the view, so Herdr never sorts by the other
+   order's keys.
 3. It is the only thing in the plugin that speaks the raw socket protocol
    (`HERDR_SOCKET_PATH`), because `agent.view.*` has no CLI subcommand in
    Herdr 0.8. One request, one reply, one connection — nothing subscribes, so
    the `events.subscribe` replay and focus-storm problems do not apply.
-4. **Quota order keeps Spaces contiguous.** The sort is
-   `workspace_order` ascending, then `quota_headroom` ascending — never a
-   flat headroom list that scatters one project's panes across the panel.
+4. **Both plugin orders keep Spaces contiguous.** The quota sort is
+   `workspace_order`, `quota_stack`, then `quota_headroom`, ascending — never
+   a flat headroom list that scatters one project's panes across the panel.
+   The tabs sort is `workspace_order`, `quota_stack`, `tab_order`,
+   `pane_order`; there `quota_stack` is the in-Space inventory position of
+   the group's head, the role, and the pane's own position, so it moves only
+   when tabs open, close, or move (the `layout` path) and never with quota.
+   Positions count per Space so a change in one Space rewrites no other.
    `$quota_group` names the Space on the tightest pane in that workspace;
    `$quota_icon` is the vendor mark on every identity row (bundled icon font;
    Muse uses a text glyph). Working/done colour is an invisible suffix matched

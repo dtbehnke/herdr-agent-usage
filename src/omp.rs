@@ -158,7 +158,10 @@ pub(crate) fn resolve_with_session(
     // question for the credential pool, not the transcript. `refresh` asks
     // omp's generic usage layer about this exact provider only.
     let resolution = match billing_for_provider(&session.provider_id) {
-        Some(_) => Resolution::Subscription(crate::model::BillingTarget::omp(&session.provider_id)),
+        Some(_) => Resolution::Subscription(crate::model::BillingTarget::omp(
+            &evidence.paths.agent_dir,
+            &session.provider_id,
+        )),
         None => Resolution::Indeterminate,
     };
     OmpRoute {

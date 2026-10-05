@@ -294,14 +294,29 @@ pub(crate) fn resolved_low_quota_alert(
 /// runs, and a panel that kept its old ordering is a cosmetic disagreement —
 /// failing the whole `--apply` over it would be worse than reporting it.
 pub(crate) fn apply_agent_order(order: AgentOrder) {
-    let result = if order.is_quota() {
-        crate::herdr::set_quota_agent_view()
+    let result = if order.owns_view() {
+        crate::herdr::set_agent_view(order)
     } else {
         crate::herdr::clear_quota_agent_view()
     };
     if let Err(error) = result {
         println!("Could not set the Herdr agent order: {error}");
     }
+}
+
+/// Switch between the quota and tabs Agent views.
+///
+/// The two orders key `quota_stack` differently, so the rows are republished
+/// under the new order before Herdr sorts by it. That pass is the ordinary
+/// debounced refresh, one metadata write per pane whose key moved.
+pub fn toggle_agent_order() -> Result<()> {
+    let cache = CacheStore::from_env()?;
+    let order = resolved_agent_order(None, Some(&cache)).toggled();
+    cache.set_agent_order(order)?;
+    prefs::write(prefs::AGENT_ORDER, order.as_str())?;
+    crate::refresh::run(&crate::model::Provider::ALL, false, false)?;
+    apply_agent_order(order);
+    Ok(())
 }
 
 pub(crate) fn resolved_row_gap(
