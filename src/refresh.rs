@@ -1125,7 +1125,7 @@ fn omp_pool_reason(
     if evidence.account_pin.is_some() || evidence.credential_id.is_none() {
         return None;
     }
-    omp_provider::pool_summary(usage, now)
+    omp_provider::pool_summary(usage, &evidence.provider_id, now)
 }
 
 /// What a fresh report says about a pane none of its accounts is proved to be.

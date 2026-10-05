@@ -76,7 +76,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   resets (`1/2 keys usable · next 3h10m`). omp's key reports carry no
   identity, so the pane cannot be matched to its own key; the pool is what
   can be proved. That line is a reason, not a window, so it never ranks the
-  pane or fires a low-quota alert.
+  pane or fires a low-quota alert. For OpenCode Go the pool counts only the
+  rolling (5h) and weekly windows omp ranks keys on: an exhausted monthly
+  allowance is display-only — it can still serve through the console's
+  balance fallback — so it neither benched a key nor delayed the next
+  comeback that was reported.
 - omp profiles no longer share a usage report or a refresh debounce. A pane
   in one profile could show the only key of another profile's pool for the
   same provider, and wait out that profile's debounce instead of asking its
