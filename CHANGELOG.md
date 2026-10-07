@@ -15,8 +15,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   The default, `all`, keeps the old behavior.
   With `workspace`, `configure` also writes a different sidebar layout: no
   Space header; a bold tab-name row leads, followed by a dimmed row of the
-  gh-pr plugin's `$pr`, `$pr_ci`, `$pr_threads`, `$pr_bot` and `$pr_unpushed`
-  tokens (empty fields and an empty row disappear). `configure --apply
+  gh-pr plugin's `$pr` token, which already combines its configured fields
+  (the row disappears without a PR). `configure --apply
   --agent-scope all|workspace` switches between the two layouts.
 - `$quota_profile` token and sidebar row for Claude panes: `profile: <config
   dir basename>`, recorded by the statusLine hook per session id, with the

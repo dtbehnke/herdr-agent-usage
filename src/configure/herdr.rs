@@ -1023,9 +1023,7 @@ fn is_standalone_agent_row(row: &Array) -> bool {
 ///
 /// `workspace`: the whole panel is one workspace, so there is no Space name to
 /// show. The tab name leads, bold, and the gh-pr plugin's tokens follow on
-/// their own dimmed row. Herdr joins the tokens of one row with ` · ` and has
-/// no separator setting, and a token with no value draws nothing, so the row
-/// vanishes without a PR and drops the fields a PR lacks.
+/// their own dimmed row: `$pr` draws nothing without a PR, so the row vanishes.
 fn append_scope_head_rows(rows: &mut Array, scope: AgentScope) {
     match scope {
         AgentScope::All => rows.push(Value::Array(styled_row(
@@ -1041,20 +1039,17 @@ fn append_scope_head_rows(rows: &mut Array, scope: AgentScope) {
     }
 }
 
-/// Tokens the gh-pr plugin publishes, in display order.
-const PR_TOKENS: [&str; 5] = ["$pr", "$pr_ci", "$pr_threads", "$pr_bot", "$pr_unpushed"];
+/// The gh-pr plugin's `$pr` is already the composite of its configured fields
+/// (`#5982 ● ↑251`), so the row renders that one token. Adding the field tokens
+/// beside it would print every field twice.
+const PR_TOKEN: &str = "$pr";
 
 fn workspace_tab_row() -> Value {
     Value::Array(styled_row("tab", None, Some(true), Some(false)))
 }
 
 fn workspace_pr_row() -> Value {
-    Value::Array(
-        PR_TOKENS
-            .into_iter()
-            .map(|token| styled_token(token, None, Some(false), Some(true)))
-            .collect(),
-    )
+    Value::Array(styled_row(PR_TOKEN, None, Some(false), Some(true)))
 }
 
 /// Exactly the rows `append_scope_head_rows` writes for `workspace`, so a
@@ -2505,10 +2500,7 @@ rows = [["state_icon", "agent"]]
             assert_eq!(tab.get("bold").and_then(Value::as_bool), Some(true));
             let pr = rows[1].as_array().unwrap();
             let names: Vec<_> = pr.iter().filter_map(configured_token_name).collect();
-            assert_eq!(
-                names,
-                ["$pr", "$pr_ci", "$pr_threads", "$pr_bot", "$pr_unpushed"]
-            );
+            assert_eq!(names, ["$pr"], "field tokens would repeat what $pr shows");
             assert!(pr.iter().all(|item| {
                 let table = item.as_inline_table().unwrap();
                 table.get("dim").and_then(Value::as_bool) == Some(true)
