@@ -143,7 +143,8 @@ pub fn run(
         }
         cache.set_low_quota_alert(alert)?;
         prefs::write(prefs::LOW_QUOTA_ALERT, &alert.to_string())?;
-        herdr::apply(agents, layout, gap, fields, brand)?;
+        let scope = resolved_agent_scope(options.agent_scope);
+        herdr::apply(agents, layout, gap, fields, brand, scope)?;
         for note in font::install(cache.root())? {
             println!("{note}");
         }
@@ -155,7 +156,6 @@ pub fn run(
         let order = resolved_agent_order(options.agent_order, Some(&cache));
         cache.set_agent_order(order)?;
         prefs::write(prefs::AGENT_ORDER, order.as_str())?;
-        let scope = resolved_agent_scope(options.agent_scope);
         prefs::write(prefs::AGENT_SCOPE, scope.as_str())?;
         apply_agent_order(order, scope);
         if agents.contains(&Harness::Claude) {
@@ -182,15 +182,13 @@ pub fn run(
         let brand = resolved_brand_colors(options.brand_colors, cache.as_ref());
         let order = resolved_agent_order(options.agent_order, cache.as_ref());
         let alert = resolved_low_quota_alert(options.low_quota_alert, cache.as_ref());
-        herdr::check(agents, layout, gap, fields, brand)?;
+        let scope = resolved_agent_scope(options.agent_scope);
+        herdr::check(agents, layout, gap, fields, brand, scope)?;
         println!("Quota percentages show {} quota.", percent.suffix());
         println!("Sidebar pacing: {}.", pacing.as_str());
         println!("Claude statusLine pace: {}.", statusline_pace.as_str());
         println!("Agent panel order: {}.", order.as_str());
-        println!(
-            "Agent panel scope: {}.",
-            resolved_agent_scope(options.agent_scope).as_str()
-        );
+        println!("Agent panel scope: {}.", scope.as_str());
         println!("Low quota alert: {alert}.");
         if agents.contains(&Harness::Claude) {
             claude::check()?;

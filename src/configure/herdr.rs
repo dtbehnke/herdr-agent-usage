@@ -1,5 +1,5 @@
 use crate::cli::{
-    AgentSelection, BrandColors, FieldSet, SidebarField, SidebarLayout, SidebarRowGap,
+    AgentScope, AgentSelection, BrandColors, FieldSet, SidebarField, SidebarLayout, SidebarRowGap,
 };
 use crate::identity::{self, PLUGIN_ID};
 use crate::model::Harness;
@@ -155,11 +155,12 @@ pub fn check(
     row_gap: SidebarRowGap,
     fields: FieldSet,
     brand: BrandColors,
+    scope: AgentScope,
 ) -> Result<()> {
     let path = config_path()?;
     let original = fs::read_to_string(&path).unwrap_or_default();
     let (updated, skipped) =
-        rewrite_quota_sidebar(&original, agents, layout, row_gap, fields, brand)?;
+        rewrite_quota_sidebar(&original, agents, layout, row_gap, fields, brand, scope)?;
     if updated == original {
         println!(
             "Herdr sidebar already contains quota tokens: {}",
@@ -185,12 +186,13 @@ pub fn apply(
     row_gap: SidebarRowGap,
     fields: FieldSet,
     brand: BrandColors,
+    scope: AgentScope,
 ) -> Result<()> {
     let path = config_path()?;
     let existed = path.exists();
     let original = fs::read_to_string(&path).unwrap_or_default();
     let (updated, skipped) =
-        rewrite_quota_sidebar(&original, agents, layout, row_gap, fields, brand)?;
+        rewrite_quota_sidebar(&original, agents, layout, row_gap, fields, brand, scope)?;
     if let Some(line) = skipped_provider_notice(&skipped) {
         println!("{line}");
     }
@@ -424,16 +426,19 @@ fn matches_installed_quota_rows(
     for (fields, brand) in variants {
         for layout in SidebarLayout::CHOICES {
             for gap in [SidebarRowGap::FLUSH, SidebarRowGap::SEPARATED] {
-                if add_quota_row_with(
-                    original,
-                    &AgentSelection::SUPPORTED,
-                    layout,
-                    gap,
-                    fields,
-                    brand,
-                )? == current
-                {
-                    return Ok(true);
+                for scope in [AgentScope::All, AgentScope::Workspace] {
+                    if add_quota_row_scoped(
+                        original,
+                        &AgentSelection::SUPPORTED,
+                        layout,
+                        gap,
+                        fields,
+                        brand,
+                        scope,
+                    )? == current
+                    {
+                        return Ok(true);
+                    }
                 }
             }
         }
@@ -472,7 +477,29 @@ pub fn add_quota_row_with(
     fields: FieldSet,
     brand: BrandColors,
 ) -> Result<String> {
-    Ok(rewrite_quota_sidebar(input, agents, layout, row_gap, fields, brand)?.0)
+    add_quota_row_scoped(
+        input,
+        agents,
+        layout,
+        row_gap,
+        fields,
+        brand,
+        AgentScope::All,
+    )
+}
+
+/// The scope picks the row layout: `workspace` drops the Space header and puts
+/// the tab name and its PR row on top, because the whole panel is one workspace.
+pub fn add_quota_row_scoped(
+    input: &str,
+    agents: &[Harness],
+    layout: SidebarLayout,
+    row_gap: SidebarRowGap,
+    fields: FieldSet,
+    brand: BrandColors,
+    scope: AgentScope,
+) -> Result<String> {
+    Ok(rewrite_quota_sidebar(input, agents, layout, row_gap, fields, brand, scope)?.0)
 }
 
 fn rewrite_quota_sidebar(
@@ -482,6 +509,7 @@ fn rewrite_quota_sidebar(
     row_gap: SidebarRowGap,
     fields: FieldSet,
     _brand: BrandColors,
+    scope: AgentScope,
 ) -> Result<(String, Vec<&'static str>)> {
     let mut document = if input.trim().is_empty() {
         DocumentMut::new()
@@ -528,6 +556,7 @@ fn rewrite_quota_sidebar(
         original_rows,
         layout,
         fields,
+        scope,
         if rows_safe {
             RowRewrite::Takeover
         } else {
@@ -563,6 +592,7 @@ fn build_managed_rows(
     original: Option<&Array>,
     layout: SidebarLayout,
     fields: FieldSet,
+    scope: AgentScope,
     rewrite: RowRewrite,
 ) -> Result<Array> {
     let preserved = match rewrite {
@@ -593,27 +623,14 @@ fn build_managed_rows(
             rows
         }
     };
-    let user_count = preserved.len();
-    let mut updated_rows = preserved;
-    append_quota_rows(&mut updated_rows, layout);
-    // Keep `$quota_group` first so Space aggregation stays the head row;
-    // user-owned extras (pane/git/other plugins) sit directly under it.
-    if user_count > 0 {
-        let mut reordered = Array::new();
-        reordered.push(
-            updated_rows
-                .get(user_count)
-                .expect("group header follows preserved rows")
-                .clone(),
-        );
-        for index in 0..user_count {
-            reordered.push(updated_rows.get(index).expect("preserved row").clone());
-        }
-        for index in (user_count + 1)..updated_rows.len() {
-            reordered.push(updated_rows.get(index).expect("quota row").clone());
-        }
-        updated_rows = reordered;
+    // Head rows first so the Space name (or the tab) stays the first row;
+    // user-owned extras (pane/git/other plugins) sit directly under them.
+    let mut updated_rows = Array::new();
+    append_scope_head_rows(&mut updated_rows, scope);
+    for row in preserved.iter() {
+        updated_rows.push(row.clone());
     }
+    append_quota_rows(&mut updated_rows, layout);
     retain_selected_fields(&mut updated_rows, fields);
     Ok(updated_rows)
 }
@@ -889,6 +906,9 @@ fn ensure_table<'a>(document: &'a mut DocumentMut, path: &[&str]) -> Result<&'a 
 
 fn strip_quota_tokens(row: &Value) -> Array {
     let mut cleaned = Array::new();
+    if is_workspace_head_row(row) {
+        return cleaned;
+    }
     if let Some(items) = row.as_array() {
         for item in items {
             let is_quota_token =
@@ -994,17 +1014,57 @@ fn is_standalone_agent_row(row: &Array) -> bool {
     row.len() == 1 && row.get(0).and_then(Value::as_str) == Some("agent")
 }
 
+/// Rows above everything else, chosen by the Agent view scope.
+///
+/// `all`: the group header — empty on non-head panes so Herdr collapses the
+/// row. The stock machine/workspace/tab identity is omitted on purpose: the
+/// group header is the Space name, and repeating it on every pane is what made
+/// the list look ungrouped.
+///
+/// `workspace`: the whole panel is one workspace, so there is no Space name to
+/// show. The tab name leads, bold, and the gh-pr plugin's tokens follow on
+/// their own dimmed row. Herdr joins the tokens of one row with ` · ` and has
+/// no separator setting, and a token with no value draws nothing, so the row
+/// vanishes without a PR and drops the fields a PR lacks.
+fn append_scope_head_rows(rows: &mut Array, scope: AgentScope) {
+    match scope {
+        AgentScope::All => rows.push(Value::Array(styled_row(
+            "$quota_group",
+            None,
+            Some(true),
+            Some(false),
+        ))),
+        AgentScope::Workspace => {
+            rows.push(workspace_tab_row());
+            rows.push(workspace_pr_row());
+        }
+    }
+}
+
+/// Tokens the gh-pr plugin publishes, in display order.
+const PR_TOKENS: [&str; 5] = ["$pr", "$pr_ci", "$pr_threads", "$pr_bot", "$pr_unpushed"];
+
+fn workspace_tab_row() -> Value {
+    Value::Array(styled_row("tab", None, Some(true), Some(false)))
+}
+
+fn workspace_pr_row() -> Value {
+    Value::Array(
+        PR_TOKENS
+            .into_iter()
+            .map(|token| styled_token(token, None, Some(false), Some(true)))
+            .collect(),
+    )
+}
+
+/// Exactly the rows `append_scope_head_rows` writes for `workspace`, so a
+/// switch back to `all` (or an uninstall) removes them and nothing else.
+fn is_workspace_head_row(row: &Value) -> bool {
+    row.to_string().trim() == workspace_tab_row().to_string().trim()
+        || row.to_string().trim() == workspace_pr_row().to_string().trim()
+}
+
 fn append_quota_rows(rows: &mut Array, layout: SidebarLayout) {
-    // Group header first: empty on non-head panes so Herdr collapses the row.
-    // The stock machine/workspace/tab identity is omitted on purpose — the
-    // group header is the Space name, and repeating it on every pane is what
-    // made the list look ungrouped.
-    rows.push(Value::Array(styled_row(
-        "$quota_group",
-        None,
-        Some(true),
-        Some(false),
-    )));
     match layout {
         SidebarLayout::Gauges => {
             append_identity_row(rows);
@@ -2406,6 +2466,111 @@ rows = [["state_icon", "agent"]]
         }
     }
 
+    fn scoped(input: &str, layout: SidebarLayout, scope: AgentScope) -> String {
+        add_quota_row_scoped(
+            input,
+            &AgentSelection::SUPPORTED,
+            layout,
+            SidebarRowGap::default(),
+            FieldSet::all(),
+            BrandColors::On,
+            scope,
+        )
+        .unwrap()
+    }
+
+    fn managed_rows(config: &str) -> Vec<Value> {
+        let document = config.parse::<DocumentMut>().unwrap();
+        document["ui"]["sidebar"]["agents"]["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .cloned()
+            .collect()
+    }
+
+    #[test]
+    fn workspace_scope_leads_with_tab_then_a_dimmed_pr_row() {
+        for layout in SidebarLayout::CHOICES {
+            let rows = managed_rows(&scoped("", layout, AgentScope::Workspace));
+            assert!(
+                rows.iter()
+                    .all(|row| !row_contains_token(row, "$quota_group")),
+                "{layout:?}"
+            );
+            let tab = rows[0].as_array().unwrap();
+            assert_eq!(tab.len(), 1);
+            let tab = tab.get(0).and_then(Value::as_inline_table).unwrap();
+            assert_eq!(tab.get("token").and_then(Value::as_str), Some("tab"));
+            assert_eq!(tab.get("bold").and_then(Value::as_bool), Some(true));
+            let pr = rows[1].as_array().unwrap();
+            let names: Vec<_> = pr.iter().filter_map(configured_token_name).collect();
+            assert_eq!(
+                names,
+                ["$pr", "$pr_ci", "$pr_threads", "$pr_bot", "$pr_unpushed"]
+            );
+            assert!(pr.iter().all(|item| {
+                let table = item.as_inline_table().unwrap();
+                table.get("dim").and_then(Value::as_bool) == Some(true)
+                    && table.get("bold").and_then(Value::as_bool) == Some(false)
+            }));
+            // The rest is unchanged: identity and the profile row follow.
+            assert!(rows
+                .iter()
+                .any(|row| row_contains_token(row, "$quota_profile")));
+        }
+    }
+
+    #[test]
+    fn all_scope_layout_has_no_tab_or_pr_row() {
+        let rows = managed_rows(&scoped("", SidebarLayout::Packed, AgentScope::All));
+        assert!(row_is_only_token(
+            &Array::from_iter(rows.iter().cloned()),
+            "$quota_group"
+        ));
+        assert!(rows
+            .iter()
+            .all(|row| !row_contains_token(row, "tab") && !row_contains_token(row, "$pr")));
+        let default =
+            add_quota_row_for("", &AgentSelection::SUPPORTED, SidebarLayout::Packed).unwrap();
+        assert_eq!(default, scoped("", SidebarLayout::Packed, AgentScope::All));
+    }
+
+    #[test]
+    fn switching_scope_is_clean_and_idempotent() {
+        let user = "[ui.sidebar.agents]\nrows = [[\"state_icon\", \"agent\"]]\n";
+        for layout in SidebarLayout::CHOICES {
+            let all = scoped(user, layout, AgentScope::All);
+            let workspace = scoped(&all, layout, AgentScope::Workspace);
+            assert_ne!(all, workspace);
+            assert_eq!(workspace, scoped(&workspace, layout, AgentScope::Workspace));
+            assert_eq!(workspace, scoped(user, layout, AgentScope::Workspace));
+            let back = scoped(&workspace, layout, AgentScope::All);
+            assert_eq!(back, all, "{layout:?}");
+        }
+    }
+
+    #[test]
+    fn workspace_scope_keeps_user_rows_and_uninstall_removes_head_rows() {
+        let managed = scoped("", SidebarLayout::Packed, AgentScope::Workspace);
+        let with_user = managed.replace("rows = [", "rows = [[\"git_branch\"], ");
+        let rows = managed_rows(&scoped(
+            &with_user,
+            SidebarLayout::Packed,
+            AgentScope::Workspace,
+        ));
+        assert!(rows.iter().any(|row| row_contains_token(row, "git_branch")));
+        let removed = remove_quota_row_for(&with_user, &AgentSelection::SUPPORTED, true).unwrap();
+        assert!(!removed.contains("$pr"), "{removed}");
+        assert!(!removed.contains("\"tab\""), "{removed}");
+        assert!(removed.contains("git_branch"));
+        // A pristine workspace install is recognised and removed completely.
+        assert_eq!(
+            remove_quota_row_for(&managed, &AgentSelection::SUPPORTED, true).unwrap(),
+            ""
+        );
+    }
+
     fn row_contains_token(row: &Value, token: &str) -> bool {
         row.as_array().is_some_and(|items| {
             items
@@ -2656,6 +2821,7 @@ claude = [["state_icon", "agent"]]
             SidebarRowGap::default(),
             FieldSet::all(),
             BrandColors::On,
+            AgentScope::All,
         )
         .unwrap()
         .1;
