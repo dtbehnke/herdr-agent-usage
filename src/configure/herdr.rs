@@ -8,7 +8,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use toml_edit::{Array, ArrayOfTables, DocumentMut, InlineTable, Item, Table, Value};
 
-const QUOTA_ROW_MARKERS: [&str; 68] = [
+const QUOTA_ROW_MARKERS: [&str; 69] = [
     "$quota_badge",
     "$quota_state",
     "$quota_icon",
@@ -31,6 +31,7 @@ const QUOTA_ROW_MARKERS: [&str; 68] = [
     "$quota_cache_ttl",
     "$quota_cache_state",
     "$quota_error",
+    "$quota_profile",
     "$quota_topic",
     "$quota_5h",
     "$quota_5h_percent",
@@ -132,6 +133,10 @@ const PROVIDER_STYLES: [(Harness, &str); 10] = [
     (Harness::Muse, "muse"),
     (Harness::Cursor, "cursor"),
 ];
+// The Claude status line's profile badge colours (xterm 201, 51 and 244).
+const PROFILE_LABS_COLOR: &str = "#ff00ff";
+const PROFILE_MAIN_COLOR: &str = "#00ffff";
+const PROFILE_OTHER_COLOR: &str = "#808080";
 const THEME_SELECTION_KEYS: [&str; 2] = ["selection_bg", "active_row_bg"];
 const OFFICIAL_IDENTITY_TOKENS: [&str; 4] = ["state_icon", "machine", "workspace", "tab"];
 
@@ -1035,6 +1040,7 @@ fn append_quota_rows(rows: &mut Array, layout: SidebarLayout) {
         }
         SidebarLayout::Stacked => {
             rows.push(Value::Array(identity_cells("$quota_provider", Some(true))));
+            append_profile_row(rows);
             rows.push(Value::Array(styled_row(
                 "$quota_model",
                 Some(IDLE_ICON_COLOR),
@@ -1067,6 +1073,24 @@ fn append_identity_row(rows: &mut Array) {
         "$quota_provider_model",
         Some(true),
     )));
+    append_profile_row(rows);
+}
+
+/// `profile: <config dir>` under a Claude pane's name, empty (so collapsed)
+/// on every other pane. Colours match the Claude status line: `.claude-labs`
+/// magenta, `.claude` cyan, any other profile grey. The labs rule comes first
+/// because `.claude` is a substring of `.claude-labs`.
+fn append_profile_row(rows: &mut Array) {
+    let mut value = InlineTable::new();
+    value.insert("token", Value::from("$quota_profile"));
+    value.insert("fg", Value::from(PROFILE_OTHER_COLOR));
+    value.insert("bold", Value::from(false));
+    value.insert("dim", Value::from(false));
+    let mut rules = Array::new();
+    rules.push(contains_fg_rule(".claude-labs", PROFILE_LABS_COLOR));
+    rules.push(contains_fg_rule(".claude", PROFILE_MAIN_COLOR));
+    value.insert("rules", Value::Array(rules));
+    rows.push(Value::Array(Array::from_iter([Value::InlineTable(value)])));
 }
 
 /// Brand icon, then the name.
@@ -1522,6 +1546,46 @@ fn print_diff_hint(layout: SidebarLayout, fields: FieldSet, _brand: BrandColors)
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn every_layout_gets_a_coloured_profile_row() {
+        for layout in [
+            SidebarLayout::Gauges,
+            SidebarLayout::Packed,
+            SidebarLayout::Stacked,
+        ] {
+            let mut rows = Array::new();
+            append_quota_rows(&mut rows, layout);
+            let row = rows
+                .iter()
+                .find(|row| row_contains_token(row, "$quota_profile"))
+                .and_then(Value::as_array)
+                .unwrap_or_else(|| panic!("{layout:?} has no profile row"));
+            assert_eq!(row.len(), 1);
+            let token = row.get(0).unwrap().as_inline_table().unwrap();
+            assert_eq!(token.get("fg").and_then(Value::as_str), Some("#808080"));
+            let rules: Vec<(String, String)> = token
+                .get("rules")
+                .and_then(Value::as_array)
+                .unwrap()
+                .iter()
+                .map(|rule| {
+                    let rule = rule.as_inline_table().unwrap();
+                    (
+                        rule.get("contains").and_then(Value::as_str).unwrap().into(),
+                        rule.get("fg").and_then(Value::as_str).unwrap().into(),
+                    )
+                })
+                .collect();
+            assert_eq!(
+                rules,
+                [
+                    (".claude-labs".to_string(), "#ff00ff".to_string()),
+                    (".claude".to_string(), "#00ffff".to_string()),
+                ]
+            );
+        }
+    }
+
     use super::*;
 
     #[test]
@@ -1935,7 +1999,12 @@ rows = [["state_icon", "agent"]]
             .unwrap();
         assert_eq!(group_index + 1, identity_index);
         assert_eq!(identity_index, provider_index);
-        assert_eq!(provider_index + 1, model_index);
+        let profile_index = rows
+            .iter()
+            .position(|row| row_contains_token(row, "$quota_profile"))
+            .unwrap();
+        assert_eq!(provider_index + 1, profile_index);
+        assert_eq!(profile_index + 1, model_index);
         assert_eq!(model_index + 1, topic_index);
         assert!(!rows
             .iter()
@@ -2217,7 +2286,14 @@ rows = [["state_icon", "agent"]]
                     updated.contains(&blocked_rule),
                     "{layout:?} is missing the blocked icon rule:\n{updated}"
                 );
-                let stable = updated.replace(&blocked_rule, "");
+                // The profile row is new; the digests pin everything else.
+                let profile_row = concat!(
+                    "[{ token = \"$quota_profile\", fg = \"#808080\", bold = false, dim = false, ",
+                    "rules = [{ contains = \".claude-labs\", fg = \"#ff00ff\" }, ",
+                    "{ contains = \".claude\", fg = \"#00ffff\" }] }], "
+                );
+                assert!(updated.contains(profile_row), "{layout:?}:\n{updated}");
+                let stable = updated.replace(&blocked_rule, "").replace(profile_row, "");
                 assert_eq!(
                     format!("{:x}", Sha256::digest(stable.as_bytes())),
                     digest,

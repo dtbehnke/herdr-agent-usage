@@ -9,7 +9,7 @@ mod statusline;
 
 use crate::cache::CacheStore;
 use crate::cli::{
-    AgentOrder, AgentSelection, BrandColors, ConfigureOptions, FieldSet, LowQuotaAlert,
+    AgentOrder, AgentScope, AgentSelection, BrandColors, ConfigureOptions, FieldSet, LowQuotaAlert,
     PercentStyle, SidebarLayout, SidebarPacing, SidebarRowGap, StatuslinePace,
 };
 use crate::model::Harness;
@@ -74,7 +74,7 @@ pub fn run(
             // Herdr keeps this view until something clears it, so an uninstall
             // that skipped it would leave the panel sorted by a token this
             // plugin no longer publishes.
-            apply_agent_order(AgentOrder::Default);
+            apply_agent_order(AgentOrder::Default, AgentScope::All);
             cache.clear_watch_interval()?;
             cache.clear_sidebar_layout()?;
             cache.clear_row_gap()?;
@@ -155,7 +155,9 @@ pub fn run(
         let order = resolved_agent_order(options.agent_order, Some(&cache));
         cache.set_agent_order(order)?;
         prefs::write(prefs::AGENT_ORDER, order.as_str())?;
-        apply_agent_order(order);
+        let scope = resolved_agent_scope(options.agent_scope);
+        prefs::write(prefs::AGENT_SCOPE, scope.as_str())?;
+        apply_agent_order(order, scope);
         if agents.contains(&Harness::Claude) {
             claude::apply_with_refresh_interval(interval)?;
         }
@@ -185,6 +187,10 @@ pub fn run(
         println!("Sidebar pacing: {}.", pacing.as_str());
         println!("Claude statusLine pace: {}.", statusline_pace.as_str());
         println!("Agent panel order: {}.", order.as_str());
+        println!(
+            "Agent panel scope: {}.",
+            resolved_agent_scope(options.agent_scope).as_str()
+        );
         println!("Low quota alert: {alert}.");
         if agents.contains(&Harness::Claude) {
             claude::check()?;
@@ -288,18 +294,19 @@ pub(crate) fn resolved_low_quota_alert(
         .unwrap_or_default()
 }
 
+pub(crate) fn resolved_agent_scope(explicit: Option<AgentScope>) -> AgentScope {
+    AgentScope::from_arg_or_env(explicit)
+        .or_else(|| prefs::read(prefs::AGENT_SCOPE).and_then(|value| AgentScope::parse(&value)))
+        .unwrap_or_default()
+}
+
 /// Hand Herdr the Agent view the user asked for, or give the panel back.
 ///
 /// Never fatal. The rows and collectors are already written by the time this
 /// runs, and a panel that kept its old ordering is a cosmetic disagreement —
 /// failing the whole `--apply` over it would be worse than reporting it.
-pub(crate) fn apply_agent_order(order: AgentOrder) {
-    let result = if order.is_quota() {
-        crate::herdr::set_quota_agent_view()
-    } else {
-        crate::herdr::clear_quota_agent_view()
-    };
-    if let Err(error) = result {
+pub(crate) fn apply_agent_order(order: AgentOrder, scope: AgentScope) {
+    if let Err(error) = crate::herdr::set_agent_view(order, scope) {
         println!("Could not set the Herdr agent order: {error}");
     }
 }

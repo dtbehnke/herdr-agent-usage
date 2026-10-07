@@ -12,6 +12,7 @@
 #   ./install.sh --statusline-pace off
 #   ./install.sh --fields topic,model,context,5h,7d
 #   ./install.sh --agent-order default
+#   ./install.sh --agent-scope workspace
 #   ./install.sh --low-quota-alert 10
 #
 # --agent installs only the agents you name (all, claude, codex, grok, agy,
@@ -49,6 +50,10 @@
 # is set back to default. default leaves Herdr's own agent panel ordering
 # alone (also Space-grouped unless the user set priority).
 #
+# --agent-scope all (default) lists every workspace's agents. workspace lists
+# only the current workspace's: the plugin's agent view gets a dynamic
+# current_workspace_id filter that Herdr follows across workspace switches.
+#
 # --low-quota-alert off (default) never notifies. A percentage notifies once,
 # per provider, when its remaining quota falls to that number or below, and
 # again only after it has recovered above it.
@@ -76,6 +81,7 @@ SIDEBAR_PACING=""
 STATUSLINE_PACE=""
 FIELDS=""
 AGENT_ORDER=""
+AGENT_SCOPE=""
 LOW_QUOTA_ALERT=""
 
 while (($# > 0)); do
@@ -133,6 +139,11 @@ while (($# > 0)); do
       AGENT_ORDER="$2"
       shift 2
       ;;
+    --agent-scope)
+      (($# >= 2)) || { printf 'error: missing value for %s\n' "$1" >&2; exit 1; }
+      AGENT_SCOPE="$2"
+      shift 2
+      ;;
     --low-quota-alert)
       (($# >= 2)) || { printf 'error: missing value for %s\n' "$1" >&2; exit 1; }
       LOW_QUOTA_ALERT="$2"
@@ -181,6 +192,10 @@ case "$AGENT_ORDER" in
   ""|default|quota) ;;
   *) die "agent-order must be default or quota" ;;
 esac
+case "$AGENT_SCOPE" in
+  ""|all|workspace) ;;
+  *) die "agent-scope must be all or workspace" ;;
+esac
 # `0` is accepted as a spelling of off, the same as configure reads it.
 case "$LOW_QUOTA_ALERT" in
   ""|off) ;;
@@ -222,6 +237,7 @@ write_plugin_pref sidebar-pacing "$SIDEBAR_PACING"
 write_plugin_pref statusline-pace "$STATUSLINE_PACE"
 write_plugin_pref fields "$FIELDS"
 write_plugin_pref agent-order "$AGENT_ORDER"
+write_plugin_pref agent-scope "$AGENT_SCOPE"
 write_plugin_pref low-quota-alert "$LOW_QUOTA_ALERT"
 
 printf '%s\n' '→ installing reversible sidebar and provider collectors'

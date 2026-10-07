@@ -6,6 +6,20 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- `--agent-scope workspace` (`install.sh --agent-scope workspace`, or
+  `configure --agent-scope`) scopes Herdr's Agent panel to the current
+  workspace with a dynamic `current_workspace_id` filter that Herdr follows
+  across workspace switches. The plugin sets it once at configure and startup.
+  The default, `all`, keeps the old behavior.
+- `$quota_profile` token and sidebar row for Claude panes: `profile: <config
+  dir basename>`, recorded by the statusLine hook per session id, with the
+  status line's colours (`.claude-labs` #ff00ff, `.claude` #00ffff, other
+  #808080). Panes without a recorded session profile publish nothing.
+- View labels: every workspace-scoped view is `in this workspace`, with or
+  without quota order. Quota order alone keeps `Quota by space`.
+
 ## [1.6.3] - 2026-09-26
 
 ### Added

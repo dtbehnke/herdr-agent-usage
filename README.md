@@ -30,6 +30,8 @@ tabs list model, topic, and context with no icon. A settings row gap of 1 still
 separates different agents; nested extra tabs of the same vendor stay flush.
 Claude and Agy stay per-pane.
 Agent order defaults to Space grouping with least quota left first inside each space.
+Agent scope defaults to every workspace; `./install.sh --agent-scope workspace` lists only the current workspace's agents, labelled `in this workspace` (a dynamic Herdr filter that follows workspace switches; Herdr keeps one Agent view, so it is shared with the quota order).
+Claude panes also publish `$quota_profile` (`profile: .claude`, `profile: .claude-labs`): the basename of the `CLAUDE_CONFIG_DIR` the pane's own statusLine hook ran with, matched by session id, and absent when the hook has not run. The sidebar row colours it like the Claude status line (`.claude-labs` magenta, `.claude` cyan, other grey). It names the config dir only; it is not evidence of which account serves the quota.
 Low-quota notifications stay off until you set a threshold. Switch layout,
 fields, percentages, and optional pacing from the settings pane
 (`prefix+shift+q`).

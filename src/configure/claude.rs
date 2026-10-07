@@ -1,4 +1,5 @@
 use super::statusline::Adapter;
+use crate::cache::statusline_session_id;
 use crate::cache::{CacheStore, DEFAULT_WATCH_INTERVAL_SECONDS};
 use crate::model::Provider;
 use crate::presentation::pace_segment;
@@ -88,6 +89,12 @@ pub fn run_statusline_hook() -> Result<()> {
             if pace_enabled {
                 pace = pace_segment(&snapshot.windows, now_unix);
             }
+            if let (Some(session_id), Some(profile)) = (
+                statusline_session_id(&value),
+                profile_name(std::env::var_os("CLAUDE_CONFIG_DIR").as_deref()),
+            ) {
+                let _ = cache.record_claude_profile(session_id, &profile);
+            }
             let generation = api_generation(&value);
             let _ = cache.save_statusline_observation_with_api_generation(
                 Provider::Claude,
@@ -119,6 +126,25 @@ pub fn run_statusline_hook() -> Result<()> {
     Ok(())
 }
 
+/// The profile name for a Claude config dir: its basename, reduced to
+/// `[A-Za-z0-9._-]` and 32 characters, the same as `caveman-statusline.sh`.
+///
+/// Claude uses `~/.claude` when `CLAUDE_CONFIG_DIR` is unset, so an unset or
+/// empty variable is `.claude`. A path with no usable name yields `None`.
+fn profile_name(config_dir: Option<&std::ffi::OsStr>) -> Option<String> {
+    let directory = config_dir
+        .filter(|directory| !directory.is_empty())
+        .map_or_else(|| PathBuf::from(".claude"), PathBuf::from);
+    let name: String = directory
+        .file_name()?
+        .to_string_lossy()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+        .take(32)
+        .collect();
+    (!name.is_empty()).then_some(name)
+}
+
 /// Add the pace to the end of the wrapped command's last line so the status
 /// line keeps whatever layout the user's own script produced.
 fn append_pace(mut stdout: Vec<u8>, pace: Option<&str>) -> Vec<u8> {
@@ -142,6 +168,25 @@ fn append_pace(mut stdout: Vec<u8>, pace: Option<&str>) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsStr;
+
+    #[test]
+    fn profile_names_follow_the_config_dir_basename() {
+        let name = |dir: Option<&str>| profile_name(dir.map(OsStr::new));
+        assert_eq!(name(Some("/Users/d/.claude")).as_deref(), Some(".claude"));
+        assert_eq!(
+            name(Some("/Users/d/.claude-labs/")).as_deref(),
+            Some(".claude-labs")
+        );
+        assert_eq!(name(None).as_deref(), Some(".claude"));
+        assert_eq!(name(Some("")).as_deref(), Some(".claude"));
+        assert_eq!(name(Some("/")), None);
+        assert_eq!(name(Some("/x/a\u{1b}[31mb c")).as_deref(), Some("a31mbc"));
+        assert_eq!(
+            name(Some(&format!("/x/{}", "a".repeat(40)))).unwrap().len(),
+            32
+        );
+    }
 
     #[test]
     fn pace_joins_the_last_status_line_and_keeps_the_trailing_newline() {

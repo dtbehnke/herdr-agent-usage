@@ -95,9 +95,10 @@ fn run_claude_collector_with_config_dir(
         .env("HERDR_BIN_PATH", herdr)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped());
-    if let Some(config_dir) = config_dir {
-        command.env("CLAUDE_CONFIG_DIR", config_dir);
-    }
+    match config_dir {
+        Some(config_dir) => command.env("CLAUDE_CONFIG_DIR", config_dir),
+        None => command.env_remove("CLAUDE_CONFIG_DIR"),
+    };
     let mut child = command.spawn().unwrap();
     child.stdin.take().unwrap().write_all(input).unwrap();
     assert!(child.wait_with_output().unwrap().status.success());
@@ -2307,6 +2308,31 @@ fn no_alert_threshold_means_no_notification_however_low_the_quota_is() {
     assert!(!log.contains("notification show"), "{log}");
 }
 
+/// The profile token comes only from the config dir the pane's own statusLine
+/// hook ran with, matched by session id; another session gets none.
+#[test]
+fn claude_pane_publishes_the_profile_its_hook_reported() {
+    let state = tempdir().unwrap();
+    let home = tempdir().unwrap();
+    let labs = home.path().join(".claude-labs");
+    let (herdr_stub, herdr_log) = install_herdr_stub(
+        state.path(),
+        r#"{"result":{"agents":[{"agent":"claude","pane_id":"w1:p1","agent_session":{"value":"test-session"},"tokens":{}}]}}"#,
+    );
+    run_claude_collector_with_config_dir(
+        state.path(),
+        &herdr_stub,
+        br#"{"session_id":"test-session","rate_limits":{"five_hour":{"used_percentage":58.0},"seven_day":{"used_percentage":27.0}}}"#,
+        Some(&labs),
+    );
+    run_claude_refresh(state.path(), &herdr_stub);
+    let log = fs::read_to_string(&herdr_log).unwrap_or_default();
+    assert!(
+        log.contains("--token quota_profile=profile: .claude-labs"),
+        "{log}"
+    );
+}
+
 /// The pane's tokens are exactly what a previous publish left behind, sort key
 /// included: this asserts the steady state, where nothing has changed and so
 /// nothing may be written.
@@ -2316,7 +2342,7 @@ fn claude_collector_does_not_republish_unchanged_quota() {
     let (herdr_stub, herdr_log) = install_herdr_stub(
         state.path(),
         &format!(
-            r#"{{"result":{{"agents":[{{"agent":"claude","pane_id":"w1:p1","agent_session":{{"value":"test-session"}},"tokens":{{"quota_group":"w1","quota_icon":"{}","quota_provider":"Claude","quota_provider_model":"Claude","quota_5h_warning":"5h 42%","quota_week_normal":"7d 73%","quota_headroom":"042","quota_stack":"042990042","quota_nest_gap":"{}"}}}}]}}}}"#,
+            r#"{{"result":{{"agents":[{{"agent":"claude","pane_id":"w1:p1","agent_session":{{"value":"test-session"}},"tokens":{{"quota_group":"w1","quota_icon":"{}","quota_provider":"Claude","quota_provider_model":"Claude","quota_5h_warning":"5h 42%","quota_week_normal":"7d 73%","quota_profile":"profile: .claude","quota_headroom":"042","quota_stack":"042990042","quota_nest_gap":"{}"}}}}]}}}}"#,
             "\u{e1a0}", "\u{200b}\u{2800}"
         ),
     );

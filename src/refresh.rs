@@ -423,8 +423,9 @@ fn run_internal(
 /// respawns the watcher. Event/focus/watch ticks stay off this path.
 fn restore_quota_agent_view(cache: &CacheStore) {
     let order = crate::configure::resolved_agent_order(None, Some(cache));
-    if order.is_quota() {
-        crate::configure::apply_agent_order(order);
+    let scope = crate::configure::resolved_agent_scope(None);
+    if order.is_quota() || scope.is_workspace() {
+        crate::configure::apply_agent_order(order, scope);
     }
 }
 
@@ -823,6 +824,18 @@ fn resolved_pane_tokens(
         }
         Resolution::Indeterminate => None,
     };
+    if let (Harness::Claude, Some(PaneQuotaUpdate::Replace(values))) = (pane.harness, &mut quota) {
+        // Only a profile the pane's own statusLine hook reported for this exact
+        // session; a pane without one publishes no token.
+        if let Some(profile) = pane
+            .session
+            .as_ref()
+            .and_then(|session| session.id())
+            .and_then(|session_id| cache.claude_profile(session_id))
+        {
+            values.quota_profile = format!("profile: {profile}");
+        }
+    }
     if quota.is_none() && (identity.is_some() || context.is_some()) {
         quota = Some(PaneQuotaUpdate::Preserve);
     }

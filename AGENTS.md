@@ -60,7 +60,7 @@ Concretely, this means:
 
 `startup` exists because Herdr drops plugin-owned Agent views when the server
 exits, and startup hooks run again after a restart or a live handoff. It
-restores plugin-owned views, forces one quota refresh, and restores the watcher.
+restores plugin-owned views (including the `workspace` scope's dynamic filter), forces one quota refresh, and restores the watcher.
 Plugin enable alone does not run startup; the configure action runs it after
 repair. Server-owned event/refresh paths also record the current Herdr binary
 and socket so an older watcher can adopt the new connection.
@@ -385,6 +385,15 @@ Adding a **sidebar field** is the same shape as #76: a saved "everything on"
 list will not name the new field. `FieldSet::parse` has to keep reading that
 exact legacy list as `all()`, and `as_list` needs a marker for the one new
 selection that would collide with it.
+
+## Claude profile token
+
+`$quota_profile` is published only from `claude-profiles.json` in the state
+dir, written by the Claude statusLine hook from its own `CLAUDE_CONFIG_DIR`
+(`src/configure/claude.rs`, `profile_name`) and looked up by the pane's session
+id (`resolved_pane_tokens` in `src/refresh.rs`). Never derive it from the cwd,
+the pane title, or the plugin's own environment. It is a label, not account
+attribution: do not use it to pick or merge quota (rule 2 below).
 
 ## Code Review Rules
 

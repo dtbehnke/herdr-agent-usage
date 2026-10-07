@@ -137,6 +137,12 @@ pub enum Command {
         /// it is set back to default.
         #[arg(long, value_enum)]
         agent_order: Option<AgentOrder>,
+        /// Which agents Herdr's Agent panel lists: all (default) or only the
+        /// current workspace. `workspace` sets a Herdr agent view owned by
+        /// this plugin with a dynamic `current_workspace_id` filter, so Herdr
+        /// follows workspace switches by itself.
+        #[arg(long, value_enum)]
+        agent_scope: Option<AgentScope>,
         /// Notify once when a provider's remaining quota falls to this
         /// percentage or below. `off` (default) never notifies.
         #[arg(long, value_parser = parse_low_quota_alert)]
@@ -517,6 +523,7 @@ pub struct ConfigureOptions {
     pub fields: Option<FieldSet>,
     pub brand_colors: Option<BrandColors>,
     pub agent_order: Option<AgentOrder>,
+    pub agent_scope: Option<AgentScope>,
     pub low_quota_alert: Option<LowQuotaAlert>,
 }
 
@@ -767,6 +774,56 @@ impl AgentOrder {
         match name.trim().to_ascii_lowercase().as_str() {
             "default" | "herdr" | "off" => Some(Self::Default),
             "quota" | "headroom" | "grouped" | "on" => Some(Self::Quota),
+            _ => None,
+        }
+    }
+
+    pub fn from_arg_or_env(value: Option<Self>) -> Option<Self> {
+        if value.is_some() {
+            return value;
+        }
+        std::env::var(Self::ENV)
+            .ok()
+            .as_deref()
+            .and_then(Self::parse)
+    }
+}
+
+/// Which agents Herdr's Agent panel lists.
+///
+/// `workspace` filters the plugin's agent view with Herdr's
+/// `current_workspace_id` context, which Herdr resolves per switch itself.
+/// The plugin sets the view once and never re-sets it on focus events.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub enum AgentScope {
+    /// Every workspace.
+    #[default]
+    All,
+    /// Only the current workspace.
+    Workspace,
+}
+
+impl AgentScope {
+    pub const ENV: &'static str = "HERDR_AGENT_QUOTA_AGENT_SCOPE";
+    /// Label for every workspace-scoped view, with or without quota order. It
+    /// reads after Herdr's panel title: "agents in this workspace".
+    pub const LABEL: &'static str = "in this workspace";
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Workspace => "workspace",
+        }
+    }
+
+    pub fn is_workspace(self) -> bool {
+        self == Self::Workspace
+    }
+
+    pub fn parse(name: &str) -> Option<Self> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "all" | "off" => Some(Self::All),
+            "workspace" | "focused" | "on" => Some(Self::Workspace),
             _ => None,
         }
     }
@@ -1085,6 +1142,16 @@ impl AgentSelection {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn an_agent_scope_round_trips_through_its_stored_form() {
+        for scope in [AgentScope::All, AgentScope::Workspace] {
+            assert_eq!(AgentScope::parse(scope.as_str()), Some(scope));
+        }
+        assert_eq!(AgentScope::parse(" Focused "), Some(AgentScope::Workspace));
+        assert_eq!(AgentScope::parse("sideways"), None);
+        assert_eq!(AgentScope::default(), AgentScope::All);
+    }
 
     #[test]
     fn an_agent_order_round_trips_through_its_stored_form() {

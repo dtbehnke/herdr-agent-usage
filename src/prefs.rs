@@ -26,10 +26,11 @@ pub const STATUSLINE_PACE: &str = "statusline-pace";
 pub const FIELDS: &str = "fields";
 pub const BRAND_COLORS: &str = "brand-colors";
 pub const AGENT_ORDER: &str = "agent-order";
+pub const AGENT_SCOPE: &str = "agent-scope";
 pub const LOW_QUOTA_ALERT: &str = "low-quota-alert";
 
 /// Every preference a full uninstall must forget.
-pub const ALL: [&str; 11] = [
+pub const ALL: [&str; 12] = [
     AGENTS,
     WATCH_INTERVAL_SECONDS,
     SIDEBAR_LAYOUT,
@@ -40,6 +41,7 @@ pub const ALL: [&str; 11] = [
     FIELDS,
     BRAND_COLORS,
     AGENT_ORDER,
+    AGENT_SCOPE,
     LOW_QUOTA_ALERT,
 ];
 

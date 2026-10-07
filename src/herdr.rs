@@ -16,7 +16,7 @@ const MAX_METADATA_TOKENS: usize = 16;
 /// not free: it is compared on every refresh and it competes for Herdr's
 /// 16-token report budget. Add a name here only together with the field that
 /// fills it.
-const METADATA_TOKEN_NAMES: [&str; 52] = [
+const METADATA_TOKEN_NAMES: [&str; 53] = [
     "quota_group",
     "quota_pad",
     "quota_icon",
@@ -66,6 +66,7 @@ const METADATA_TOKEN_NAMES: [&str; 52] = [
     "quota_share_month_unknown",
     "quota_topic",
     "quota_error",
+    "quota_profile",
     HEADROOM_TOKEN,
     STACK_TOKEN,
     NEST_GAP_TOKEN,
@@ -173,8 +174,9 @@ const CONTEXT_TOKEN_NAMES: [&str; 4] = [
 /// Values that must reach the pane in the *same* report that changed them,
 /// even when the budget is tight: the identity, the live diagnostics, and the
 /// inline week variants, whose styling flips as soon as a 5h window appears.
-const ROWS_THAT_MUST_NOT_LAG: [&str; 19] = [
+const ROWS_THAT_MUST_NOT_LAG: [&str; 20] = [
     "quota_group",
+    "quota_profile",
     "quota_icon",
     "quota_provider",
     "quota_model",
@@ -371,30 +373,64 @@ pub fn notify(title: &str, body: &str) -> Result<()> {
 /// sidebar sort is never worth blocking a turn for.
 const SOCKET_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// Ask Herdr to order its Agent panel by space, then least quota left.
+/// The `agent.view.set` params for the order and scope the user chose, or
+/// `None` when Herdr should keep its own view (`clear`).
+///
+/// The workspace filter uses Herdr's `current_workspace_id` context, so Herdr
+/// re-evaluates it on every workspace switch; nothing here depends on focus.
+fn agent_view_params(
+    order: crate::cli::AgentOrder,
+    scope: crate::cli::AgentScope,
+) -> Option<Value> {
+    if !order.is_quota() && !scope.is_workspace() {
+        return None;
+    }
+    let label = if scope.is_workspace() {
+        crate::cli::AgentScope::LABEL
+    } else {
+        crate::cli::AgentOrder::LABEL
+    };
+    let mut params = serde_json::json!({
+        "source": identity::agent_view_source(),
+        "label": label,
+    });
+    if order.is_quota() {
+        params["sort"] = serde_json::json!([
+            {"field": "workspace_order", "order": "asc"},
+            {"field": {"token": STACK_TOKEN}, "order": "asc"},
+            {"field": {"token": HEADROOM_TOKEN}, "order": "asc"},
+        ]);
+    }
+    if scope.is_workspace() {
+        params["filter"] = serde_json::json!({
+            "op": "eq",
+            "field": "workspace_id",
+            "value": {"context": "current_workspace_id"},
+        });
+    }
+    Some(params)
+}
+
+/// Ask Herdr to order and/or scope its Agent panel.
 ///
 /// Herdr keeps one Agent view and this replaces it. The default agent order
 /// is `quota`, so configure and startup both call this unless the user
-/// chose `default`. The view does not survive a server restart, which is
-/// why the startup hook re-applies it.
+/// chose `default` with the `all` scope. The view does not survive a server
+/// restart, which is why the startup hook re-applies it.
 ///
 /// `workspace_order` keeps each Space contiguous — the same grouping Herdr's
 /// own spaces sort uses — so quota ranking never scatters one project's
 /// agents across the panel. Inside a space, `quota_headroom` ranks tightest
-/// first.
-pub fn set_quota_agent_view() -> Result<()> {
+/// first. Under the `workspace` scope the view also filters on Herdr's
+/// `current_workspace_id` context, set once.
+pub fn set_agent_view(order: crate::cli::AgentOrder, scope: crate::cli::AgentScope) -> Result<()> {
+    let Some(params) = agent_view_params(order, scope) else {
+        return clear_quota_agent_view();
+    };
     socket_request(&serde_json::json!({
         "id": "agent-quota:view-set",
         "method": "agent.view.set",
-        "params": {
-            "source": identity::agent_view_source(),
-            "label": crate::cli::AgentOrder::LABEL,
-            "sort": [
-                {"field": "workspace_order", "order": "asc"},
-                {"field": {"token": STACK_TOKEN}, "order": "asc"},
-                {"field": {"token": HEADROOM_TOKEN}, "order": "asc"},
-            ],
-        },
+        "params": params,
     }))
     .map(|_| ())
 }
@@ -1896,6 +1932,7 @@ fn desired_tokens(
         values.quota_month_severity,
     );
     insert_optional_token(&mut tokens, "quota_topic", topic);
+    insert_optional_token(&mut tokens, "quota_profile", &values.quota_profile);
     if let Some(error) = &values.quota_error {
         tokens.insert("quota_error".to_string(), error.clone());
     }
@@ -2516,6 +2553,45 @@ fn is_help_command_row(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn agent_view_params_follow_order_and_scope() {
+        use crate::cli::{AgentOrder, AgentScope};
+        let dynamic = serde_json::json!(
+            {"op":"eq","field":"workspace_id","value":{"context":"current_workspace_id"}}
+        );
+        let quota = agent_view_params(AgentOrder::Quota, AgentScope::All).unwrap();
+        assert!(quota.get("filter").is_none());
+        assert_eq!(quota["sort"].as_array().unwrap().len(), 3);
+        assert_eq!(quota["label"], "Quota by space");
+
+        let both = agent_view_params(AgentOrder::Quota, AgentScope::Workspace).unwrap();
+        assert_eq!(both["filter"], dynamic);
+        assert_eq!(both["sort"].as_array().unwrap().len(), 3);
+        assert_eq!(both["label"], "in this workspace");
+
+        let scope_only = agent_view_params(AgentOrder::Default, AgentScope::Workspace).unwrap();
+        assert_eq!(scope_only["filter"], dynamic);
+        assert!(scope_only.get("sort").is_none());
+        assert_eq!(scope_only["label"], "in this workspace");
+
+        assert!(agent_view_params(AgentOrder::Default, AgentScope::All).is_none());
+    }
+
+    #[test]
+    fn agent_view_labels_are_short_and_never_say_test() {
+        use crate::cli::{AgentOrder, AgentScope};
+        for order in [AgentOrder::Default, AgentOrder::Quota] {
+            for scope in [AgentScope::All, AgentScope::Workspace] {
+                let Some(params) = agent_view_params(order, scope) else {
+                    continue;
+                };
+                let label = params["label"].as_str().unwrap();
+                assert!(label.chars().count() <= 32, "{label}");
+                assert!(!label.to_lowercase().contains("test"), "{label}");
+            }
+        }
+    }
+
     use super::*;
     use crate::cli::{FieldSet, PercentStyle, SidebarField, SidebarLayout};
     use crate::model::{

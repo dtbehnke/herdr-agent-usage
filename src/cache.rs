@@ -39,6 +39,14 @@ const LOW_QUOTA_ALERTED_FILE: &str = "low-quota-alerted";
 /// still teal. This file is the plugin's own seen-state.
 const ICON_ATTENTION_FILE: &str = "icon-attention.json";
 const MAX_STATUSLINE_SESSIONS: usize = 128;
+/// Claude session id to the config dir basename its statusLine hook ran with.
+const CLAUDE_PROFILES_FILE: &str = "claude-profiles.json";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ClaudeProfileEntry {
+    profile: String,
+    seen_unix: u64,
+}
 
 /// Working / unseen pane ids for `$quota_icon_*` colour.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -87,6 +95,60 @@ impl CacheStore {
     pub fn ensure(&self) -> Result<()> {
         fs::create_dir_all(&self.root)
             .with_context(|| format!("create cache directory {}", self.root.display()))
+    }
+
+    /// Remember which Claude config dir a session's statusLine hook ran with.
+    ///
+    /// The hook inherits `CLAUDE_CONFIG_DIR` from the Claude process itself,
+    /// so this is the one place a pane's profile is provable. Rewrites only
+    /// when the entry is new or changed, and drops the oldest entries past
+    /// [`MAX_STATUSLINE_SESSIONS`]. A lost race between two hooks is repaired
+    /// by the next statusLine call of the session that lost.
+    pub fn record_claude_profile(&self, session_id: &str, profile: &str) -> Result<()> {
+        let mut entries = self.claude_profiles();
+        if entries
+            .get(session_id)
+            .is_some_and(|entry| entry.profile == profile)
+        {
+            return Ok(());
+        }
+        entries.insert(
+            session_id.to_string(),
+            ClaudeProfileEntry {
+                profile: profile.to_string(),
+                seen_unix: Self::now_unix(),
+            },
+        );
+        while entries.len() > MAX_STATUSLINE_SESSIONS {
+            let Some(oldest) = entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.seen_unix)
+                .map(|(id, _)| id.clone())
+            else {
+                break;
+            };
+            entries.remove(&oldest);
+        }
+        self.ensure()?;
+        let temporary = self
+            .root
+            .join(format!(".claude-profiles.{}.tmp", std::process::id()));
+        let bytes = serde_json::to_vec(&entries).context("serialize Claude profiles")?;
+        Self::atomic_replace(&self.root.join(CLAUDE_PROFILES_FILE), &temporary, bytes)
+    }
+
+    /// The config dir basename recorded for a Claude session, if any.
+    pub fn claude_profile(&self, session_id: &str) -> Option<String> {
+        self.claude_profiles()
+            .remove(session_id)
+            .map(|entry| entry.profile)
+    }
+
+    fn claude_profiles(&self) -> BTreeMap<String, ClaudeProfileEntry> {
+        fs::read(self.root.join(CLAUDE_PROFILES_FILE))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or_default()
     }
 
     pub fn load(&self, provider: Provider) -> Result<Option<ProviderSnapshot>> {
@@ -1407,7 +1469,7 @@ fn prune_session_map<T>(map: &mut BTreeMap<String, T>, current_session_ids: &[St
     }
 }
 
-fn statusline_session_id(observation: &Value) -> Option<&str> {
+pub fn statusline_session_id(observation: &Value) -> Option<&str> {
     observation
         .get("session_id")
         .or_else(|| observation.get("sessionId"))
@@ -1472,6 +1534,25 @@ fn sessions_match(previous_session_id: Option<&str>, session_id: Option<&str>) -
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn claude_profiles_are_recorded_per_session_and_bounded() {
+        let dir = tempdir().unwrap();
+        let cache = CacheStore::new(dir.path());
+        assert_eq!(cache.claude_profile("s1"), None);
+        cache.record_claude_profile("s1", ".claude-labs").unwrap();
+        cache.record_claude_profile("s2", ".claude").unwrap();
+        assert_eq!(cache.claude_profile("s1").as_deref(), Some(".claude-labs"));
+        assert_eq!(cache.claude_profile("s2").as_deref(), Some(".claude"));
+        cache.record_claude_profile("s1", ".claude").unwrap();
+        assert_eq!(cache.claude_profile("s1").as_deref(), Some(".claude"));
+        for index in 0..(MAX_STATUSLINE_SESSIONS + 8) {
+            cache
+                .record_claude_profile(&format!("bulk-{index}"), ".claude")
+                .unwrap();
+        }
+        assert_eq!(cache.claude_profiles().len(), MAX_STATUSLINE_SESSIONS);
+    }
+
     use super::{merge_profile_quota_windows, *};
     use crate::model::{
         window_in, BillingTarget, CacheUsage, ContextUsage, Provider, ResetAt, UsageWindow,

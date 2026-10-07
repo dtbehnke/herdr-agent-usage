@@ -157,6 +157,10 @@ pub struct MetadataTokens {
     pub quota_cache_state: String,
     /// The plugin could not speak for this pane at all.
     pub quota_error: Option<String>,
+    /// `profile: <config dir basename>` for a Claude pane whose statusLine hook
+    /// reported its config dir. Empty when unknown. A label only, never
+    /// evidence for which account serves the quota.
+    pub quota_profile: String,
     /// Remaining quota in the tightest window this pane knows about, as a
     /// whole percent. `None` when no window reported one.
     ///
@@ -362,6 +366,7 @@ impl MetadataTokens {
             quota_cache_ttl: sidebar_cache_ttl(context, now_unix),
             quota_cache_state: sidebar_cache_state(context, now_unix),
             quota_error: None,
+            quota_profile: String::new(),
             // Once any displayed Claude window is stale, there is no current
             // provider headroom to sort or use for alert recovery. Returning
             // None also preserves an already-fired low-quota alert until a
@@ -395,6 +400,7 @@ impl MetadataTokens {
             quota_cache_ttl: String::new(),
             quota_cache_state: String::new(),
             quota_error: Some(reason.into().chars().take(80).collect()),
+            quota_profile: String::new(),
             quota_headroom: None,
         }
     }

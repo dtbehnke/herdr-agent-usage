@@ -55,6 +55,7 @@ fn main() -> Result<()> {
             fields,
             brand_colors,
             agent_order,
+            agent_scope,
             low_quota_alert,
         } => herdr_agent_quota::configure::run(
             check,
@@ -71,6 +72,7 @@ fn main() -> Result<()> {
                 fields,
                 brand_colors,
                 agent_order,
+                agent_scope,
                 low_quota_alert,
             },
         ),
