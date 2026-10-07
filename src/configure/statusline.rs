@@ -19,6 +19,14 @@ impl Adapter {
             .and_then(|value| value.get("command"))
             .and_then(Value::as_str);
         if self.is_installed(settings.get("statusLine")) {
+            if command.is_some_and(|command| self.runs_collector(command, executable)) {
+                println!(
+                    "{} statusLine collector is installed: {}",
+                    self.label,
+                    path.display()
+                );
+                return Ok(());
+            }
             // An upgrade that skipped `configure --apply` (the plugin id
             // rename, a moved checkout) leaves the hook feeding another state
             // directory, so this install never receives an observation.
@@ -58,6 +66,26 @@ impl Adapter {
     ) -> Result<()> {
         let mut settings = read_settings(path, self.label)?;
         let installed = self.is_installed(settings.get("statusLine"));
+        // A command that already runs this binary's collector — possibly inside
+        // the user's own wrapper — is the install. Rewriting it would drop the
+        // wrapper.
+        if installed
+            && settings
+                .get("statusLine")
+                .and_then(|value| value.get("command"))
+                .and_then(Value::as_str)
+                .is_some_and(|command| self.runs_collector(command, executable))
+        {
+            // Only the plugin-owned refresh interval may still change.
+            if let Some(seconds) = refresh_interval_seconds {
+                let current = settings["statusLine"].get("refreshInterval");
+                if current != Some(&Value::from(seconds)) {
+                    settings["statusLine"]["refreshInterval"] = Value::from(seconds);
+                    write_settings(path, &settings, self.label)?;
+                }
+            }
+            return Ok(());
+        }
         if !installed && !can_chain_statusline(settings.get("statusLine")) {
             anyhow::bail!(
                 "existing {} statusLine has no safely chainable command; refusing to replace it",
@@ -112,6 +140,18 @@ impl Adapter {
         if !self.is_installed(settings.get("statusLine")) {
             return Ok(());
         }
+        // Only the command this plugin wrote is ours to undo. A user wrapper
+        // around the collector stays, and so does its backup.
+        let written = settings
+            .get("statusLine")
+            .and_then(|value| value.get("command"))
+            .and_then(Value::as_str)
+            .is_some_and(|command| {
+                self.is_plugin_written(command) || command.contains("agy-statusline.sh")
+            });
+        if !written {
+            return Ok(());
+        }
         let backup = state.join(self.backup_file);
         let original: Value = if backup.exists() {
             serde_json::from_slice(&fs::read(&backup)?)?
@@ -164,6 +204,30 @@ impl Adapter {
             shell_quote(executable),
             self.subcommand
         )
+    }
+
+    /// The command runs this binary's collector: the binary path, then the
+    /// subcommand, wherever the user's own wrapper puts them.
+    fn runs_collector(&self, command: &str, executable: &Path) -> bool {
+        let path = executable.display().to_string();
+        command
+            .find(&path)
+            .is_some_and(|at| command[at + path.len()..].contains(self.subcommand))
+    }
+
+    /// Exactly the shape `wrapper_command` writes, for any state directory and
+    /// binary path: `HERDR_PLUGIN_STATE_DIR='…' '…' <subcommand>`.
+    fn is_plugin_written(&self, command: &str) -> bool {
+        let Some(rest) = command.strip_prefix("HERDR_PLUGIN_STATE_DIR=") else {
+            return false;
+        };
+        let Some((_, rest)) = split_shell_quoted(rest) else {
+            return false;
+        };
+        let Some((_, rest)) = rest.strip_prefix(' ').and_then(split_shell_quoted) else {
+            return false;
+        };
+        rest.strip_prefix(' ') == Some(self.subcommand)
     }
 
     fn is_installed(&self, status_line: Option<&Value>) -> bool {
@@ -238,6 +302,24 @@ fn write_settings(path: &Path, settings: &Value, label: &str) -> Result<()> {
     let temporary = path.with_extension(format!("json.{PLUGIN_ID}.tmp"));
     fs::write(&temporary, serde_json::to_vec_pretty(settings)?)?;
     fs::rename(temporary, path).with_context(|| format!("replace {label} settings"))
+}
+
+/// Reads one `shell_quote` word off the front of `text`.
+fn split_shell_quoted(text: &str) -> Option<(String, &str)> {
+    let mut rest = text.strip_prefix('\'')?;
+    let mut word = String::new();
+    loop {
+        let end = rest.find('\'')?;
+        word.push_str(&rest[..end]);
+        rest = &rest[end + 1..];
+        match rest.strip_prefix("\\''") {
+            Some(next) => {
+                word.push('\'');
+                rest = next;
+            }
+            None => return Some((word, rest)),
+        }
+    }
 }
 
 fn shell_quote(path: &Path) -> String {

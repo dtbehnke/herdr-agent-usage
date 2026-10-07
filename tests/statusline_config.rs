@@ -270,3 +270,57 @@ fn check_reports_a_statusline_that_feeds_the_pre_rename_install_as_stale() {
     assert!(report.contains("Claude statusLine collector is installed"));
     assert!(!report.contains("stale"));
 }
+
+#[test]
+fn a_user_wrapper_around_the_collector_is_left_alone() {
+    let directory = tempdir().unwrap();
+    let settings = directory.path().join("settings.json");
+    let state = directory.path().join("state");
+    let executable = directory.path().join("target/release/herdr-agent-usage");
+    let command = format!(
+        "STATUSLINE_OSC8=1 /usr/bin/python3 \"$HOME/.claude/hooks/statusline-wrapper.py\" -- \
+         HERDR_PLUGIN_STATE_DIR='/elsewhere/state' '{}' claude-statusline",
+        executable.display()
+    );
+    let original = serde_json::to_vec_pretty(&serde_json::json!({
+        "statusLine": {"type": "command", "command": command, "refreshInterval": 60}
+    }))
+    .unwrap();
+    fs::write(&settings, &original).unwrap();
+
+    claude::apply_at(&settings, &state, &executable).unwrap();
+    assert_eq!(fs::read(&settings).unwrap(), original);
+    // A changed interval is the one thing apply may still write.
+    claude::apply_at_with_refresh_interval(&settings, &state, &executable, 120).unwrap();
+    let updated: Value = serde_json::from_slice(&fs::read(&settings).unwrap()).unwrap();
+    assert_eq!(updated["statusLine"]["refreshInterval"], 120);
+    assert_eq!(updated["statusLine"]["command"], command.as_str());
+    fs::write(&settings, &original).unwrap();
+    assert!(!state.join("claude-statusline.original.json").exists());
+
+    claude::uninstall_at(&settings, &state).unwrap();
+    assert_eq!(fs::read(&settings).unwrap(), original);
+}
+
+#[test]
+fn a_wrapper_around_another_binary_is_still_replaced() {
+    let directory = tempdir().unwrap();
+    let settings = directory.path().join("settings.json");
+    let state = directory.path().join("state");
+    let executable = directory.path().join("herdr-agent-usage");
+    fs::write(
+        &settings,
+        r#"{"statusLine":{"type":"command","command":"python3 wrap.py -- echo claude-statusline"}}"#,
+    )
+    .unwrap();
+    claude::apply_at(&settings, &state, &executable).unwrap();
+    let installed: Value = serde_json::from_slice(&fs::read(&settings).unwrap()).unwrap();
+    let command = installed["statusLine"]["command"].as_str().unwrap();
+    assert!(command.starts_with("HERDR_PLUGIN_STATE_DIR="), "{command}");
+    claude::uninstall_at(&settings, &state).unwrap();
+    let restored: Value = serde_json::from_slice(&fs::read(&settings).unwrap()).unwrap();
+    assert!(restored["statusLine"]["command"]
+        .as_str()
+        .unwrap()
+        .starts_with("python3 wrap.py"));
+}
