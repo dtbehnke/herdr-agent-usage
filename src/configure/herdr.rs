@@ -617,10 +617,11 @@ fn build_managed_rows(
                     if is_official_identity_row(&cleaned) || is_navigation_identity_row(&cleaned) {
                         continue;
                     }
-                    // The workspace head is `[tab]` + `[$pr]`; a hand-made
-                    // `[tab]` / `[tab, $pr]` row (the old first row) is the
-                    // same thing, so replacing it avoids a second tab.
-                    if scope.is_workspace() && is_tab_pr_row(&cleaned) {
+                    // Both heads own the tab row: `[tab, $pr]` for `all`,
+                    // `[tab]` + `[$pr]` for `workspace`. A hand-made
+                    // `[tab]` / `[tab, $pr]` row is the same thing, so
+                    // replacing it avoids a second tab.
+                    if is_tab_pr_row(&cleaned) {
                         continue;
                     }
                     rows.push(Value::Array(cleaned));
@@ -912,7 +913,7 @@ fn ensure_table<'a>(document: &'a mut DocumentMut, path: &[&str]) -> Result<&'a 
 
 fn strip_quota_tokens(row: &Value) -> Array {
     let mut cleaned = Array::new();
-    if is_workspace_head_row(row) {
+    if is_scope_head_row(row) {
         return cleaned;
     }
     if let Some(items) = row.as_array() {
@@ -1022,8 +1023,8 @@ fn is_standalone_agent_row(row: &Array) -> bool {
 
 /// Rows above everything else, chosen by the Agent view scope.
 ///
-/// `all`: the group header — empty on non-head panes so Herdr collapses the
-/// row. The stock machine/workspace/tab identity is omitted on purpose: the
+/// `all`: the tab and PR on one row (the layout from before scopes), then the
+/// group header — empty on non-head panes so Herdr collapses the row. The stock machine/workspace/tab identity is omitted on purpose: the
 /// group header is the Space name, and repeating it on every pane is what made
 /// the list look ungrouped.
 ///
@@ -1032,12 +1033,15 @@ fn is_standalone_agent_row(row: &Array) -> bool {
 /// their own dimmed row: `$pr` draws nothing without a PR, so the row vanishes.
 fn append_scope_head_rows(rows: &mut Array, scope: AgentScope) {
     match scope {
-        AgentScope::All => rows.push(Value::Array(styled_row(
-            "$quota_group",
-            None,
-            Some(true),
-            Some(false),
-        ))),
+        AgentScope::All => {
+            rows.push(all_tab_pr_row());
+            rows.push(Value::Array(styled_row(
+                "$quota_group",
+                None,
+                Some(true),
+                Some(false),
+            )));
+        }
         AgentScope::Workspace => {
             rows.push(workspace_tab_row());
             rows.push(workspace_pr_row());
@@ -1049,6 +1053,7 @@ fn append_scope_head_rows(rows: &mut Array, scope: AgentScope) {
 /// (`#5982 ● ↑251`), so the row renders that one token. Adding the field tokens
 /// beside it would print every field twice.
 const PR_TOKEN: &str = "$pr";
+const PR_ALL_COLOR: &str = "#94e2d5";
 
 /// Exactly `[tab]` or `[tab, $pr]`, with any styling.
 fn is_tab_pr_row(row: &Array) -> bool {
@@ -1064,11 +1069,21 @@ fn workspace_pr_row() -> Value {
     Value::Array(styled_row(PR_TOKEN, None, Some(false), Some(true)))
 }
 
-/// Exactly the rows `append_scope_head_rows` writes for `workspace`, so a
-/// switch back to `all` (or an uninstall) removes them and nothing else.
-fn is_workspace_head_row(row: &Value) -> bool {
-    row.to_string().trim() == workspace_tab_row().to_string().trim()
-        || row.to_string().trim() == workspace_pr_row().to_string().trim()
+/// The first row Herdr users had before scopes: bold tab, teal bold `$pr`.
+fn all_tab_pr_row() -> Value {
+    Value::Array(Array::from_iter([
+        styled_token("tab", None, Some(true), None),
+        styled_token(PR_TOKEN, Some(PR_ALL_COLOR), Some(true), None),
+    ]))
+}
+
+/// Exactly the rows `append_scope_head_rows` writes for either scope, so a
+/// switch (or an uninstall) removes them and nothing else.
+fn is_scope_head_row(row: &Value) -> bool {
+    let text = row.to_string();
+    [all_tab_pr_row(), workspace_tab_row(), workspace_pr_row()]
+        .iter()
+        .any(|head| head.to_string().trim() == text.trim())
 }
 
 fn append_quota_rows(rows: &mut Array, layout: SidebarLayout) {
@@ -1779,7 +1794,7 @@ mod tests {
                 let agents = &parsed["ui"]["sidebar"]["agents"];
                 let shared = agents["rows"].as_array().unwrap();
                 assert_eq!(
-                    shared.get(1).unwrap().to_string().trim(),
+                    shared.get(2).unwrap().to_string().trim(),
                     custom.to_string()
                 );
                 // Takeover installs shared rows only; brand-on no longer
@@ -1908,7 +1923,8 @@ mod tests {
             .as_array()
             .unwrap();
         assert!(row_is_only_token(provider, "$quota_group"));
-        assert_eq!(token_names(provider.get(1).unwrap()), ["agent"]);
+        assert_eq!(token_names(provider.get(0).unwrap()), ["tab", "$pr"]);
+        assert_eq!(token_names(provider.get(2).unwrap()), ["agent"]);
         assert_eq!(add_quota_row(&updated).unwrap(), updated);
     }
 
@@ -2360,7 +2376,13 @@ rows = [["state_icon", "agent"]]
                     "{ contains = \".claude\", fg = \"#00ffff\" }] }], "
                 );
                 assert!(updated.contains(profile_row), "{layout:?}:\n{updated}");
-                let stable = updated.replace(&blocked_rule, "").replace(profile_row, "");
+                // So is the scope head row that sits above the group header.
+                let head_row = format!("{}, ", all_tab_pr_row());
+                assert!(updated.contains(&head_row), "{layout:?}:\n{updated}");
+                let stable = updated
+                    .replace(&blocked_rule, "")
+                    .replace(profile_row, "")
+                    .replace(&head_row, "");
                 assert_eq!(
                     format!("{:x}", Sha256::digest(stable.as_bytes())),
                     digest,
@@ -2526,15 +2548,14 @@ rows = [["state_icon", "agent"]]
     }
 
     #[test]
-    fn all_scope_layout_has_no_tab_or_pr_row() {
+    fn all_scope_leads_with_the_old_tab_pr_row_then_the_group_header() {
         let rows = managed_rows(&scoped("", SidebarLayout::Packed, AgentScope::All));
-        assert!(row_is_only_token(
-            &Array::from_iter(rows.iter().cloned()),
-            "$quota_group"
-        ));
-        assert!(rows
-            .iter()
-            .all(|row| !row_contains_token(row, "tab") && !row_contains_token(row, "$pr")));
+        assert_eq!(rows[0].to_string().trim(), all_tab_pr_row().to_string());
+        assert_eq!(
+            rows[0].to_string().trim(),
+            "[{ token = \"tab\", bold = true }, { token = \"$pr\", fg = \"#94e2d5\", bold = true }]"
+        );
+        assert!(row_contains_token(&rows[1], "$quota_group"));
         let default =
             add_quota_row_for("", &AgentSelection::SUPPORTED, SidebarLayout::Packed).unwrap();
         assert_eq!(default, scoped("", SidebarLayout::Packed, AgentScope::All));
@@ -2621,7 +2642,30 @@ rows = [["state_icon", "agent"]]
                 .count(),
             1
         );
-        assert!(row_contains_token(&rows[0], "$quota_group"));
+        assert!(row_contains_token(&rows[1], "$quota_group"));
+    }
+
+    #[test]
+    fn the_scope_round_trip_restores_identical_output() {
+        let user = "[ui.sidebar.agents]\nrows = [[\"state_icon\", \"agent\"]]\n";
+        for layout in SidebarLayout::CHOICES {
+            let all = scoped(user, layout, AgentScope::All);
+            let workspace = scoped(&all, layout, AgentScope::Workspace);
+            assert_ne!(all, workspace);
+            let all_again = scoped(&workspace, layout, AgentScope::All);
+            assert_eq!(all, all_again, "{layout:?}");
+            assert_eq!(
+                workspace,
+                scoped(&all_again, layout, AgentScope::Workspace),
+                "{layout:?}"
+            );
+            let rows = managed_rows(&all);
+            let tabs = rows
+                .iter()
+                .filter(|row| row_contains_token(row, "tab"))
+                .count();
+            assert_eq!(tabs, 1, "{layout:?}");
+        }
     }
 
     fn row_contains_token(row: &Value, token: &str) -> bool {
