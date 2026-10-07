@@ -1030,7 +1030,7 @@ fn is_standalone_agent_row(row: &Array) -> bool {
 ///
 /// `workspace`: the whole panel is one workspace, so there is no Space name to
 /// show. The tab name leads, bold, and the gh-pr plugin's tokens follow on
-/// their own dimmed row: `$pr` draws nothing without a PR, so the row vanishes.
+/// their own lavender row: `$pr` draws nothing without a PR, so the row vanishes.
 fn append_scope_head_rows(rows: &mut Array, scope: AgentScope) {
     match scope {
         AgentScope::All => {
@@ -1053,7 +1053,10 @@ fn append_scope_head_rows(rows: &mut Array, scope: AgentScope) {
 /// (`#5982 ● ↑251`), so the row renders that one token. Adding the field tokens
 /// beside it would print every field twice.
 const PR_TOKEN: &str = "$pr";
-const PR_ALL_COLOR: &str = "#94e2d5";
+/// Catppuccin lavender: readable, and far from the cyan profile row.
+const PR_COLOR: &str = "#b4befe";
+/// The teal the `all` head used before; still recognised so it is replaced.
+const LEGACY_PR_TEAL: &str = "#94e2d5";
 
 /// Exactly `[tab]` or `[tab, $pr]`, with any styling.
 fn is_tab_pr_row(row: &Array) -> bool {
@@ -1066,23 +1069,44 @@ fn workspace_tab_row() -> Value {
 }
 
 fn workspace_pr_row() -> Value {
-    Value::Array(styled_row(PR_TOKEN, None, Some(false), Some(true)))
+    Value::Array(styled_row(
+        PR_TOKEN,
+        Some(PR_COLOR),
+        Some(false),
+        Some(false),
+    ))
 }
 
-/// The first row Herdr users had before scopes: bold tab, teal bold `$pr`.
+/// The first row Herdr users had before scopes: bold tab, then `$pr` in
+/// lavender, not bold.
 fn all_tab_pr_row() -> Value {
     Value::Array(Array::from_iter([
         styled_token("tab", None, Some(true), None),
-        styled_token(PR_TOKEN, Some(PR_ALL_COLOR), Some(true), None),
+        styled_token(PR_TOKEN, Some(PR_COLOR), Some(false), Some(false)),
     ]))
+}
+
+/// Head rows earlier versions wrote, recognised so they are replaced.
+fn legacy_head_rows() -> [Value; 2] {
+    [
+        // `all`: teal bold `$pr`.
+        Value::Array(Array::from_iter([
+            styled_token("tab", None, Some(true), None),
+            styled_token(PR_TOKEN, Some(LEGACY_PR_TEAL), Some(true), None),
+        ])),
+        // `workspace`: dimmed, uncoloured `$pr`.
+        Value::Array(styled_row(PR_TOKEN, None, Some(false), Some(true))),
+    ]
 }
 
 /// Exactly the rows `append_scope_head_rows` writes for either scope, so a
 /// switch (or an uninstall) removes them and nothing else.
 fn is_scope_head_row(row: &Value) -> bool {
     let text = row.to_string();
-    [all_tab_pr_row(), workspace_tab_row(), workspace_pr_row()]
+    let current = [all_tab_pr_row(), workspace_tab_row(), workspace_pr_row()];
+    current
         .iter()
+        .chain(legacy_head_rows().iter())
         .any(|head| head.to_string().trim() == text.trim())
 }
 
@@ -2519,7 +2543,7 @@ rows = [["state_icon", "agent"]]
     }
 
     #[test]
-    fn workspace_scope_leads_with_tab_then_a_dimmed_pr_row() {
+    fn workspace_scope_leads_with_tab_then_a_lavender_pr_row() {
         for layout in SidebarLayout::CHOICES {
             let rows = managed_rows(&scoped("", layout, AgentScope::Workspace));
             assert!(
@@ -2537,7 +2561,8 @@ rows = [["state_icon", "agent"]]
             assert_eq!(names, ["$pr"], "field tokens would repeat what $pr shows");
             assert!(pr.iter().all(|item| {
                 let table = item.as_inline_table().unwrap();
-                table.get("dim").and_then(Value::as_bool) == Some(true)
+                table.get("dim").and_then(Value::as_bool) == Some(false)
+                    && table.get("fg").and_then(Value::as_str) == Some("#b4befe")
                     && table.get("bold").and_then(Value::as_bool) == Some(false)
             }));
             // The rest is unchanged: identity and the profile row follow.
@@ -2553,7 +2578,7 @@ rows = [["state_icon", "agent"]]
         assert_eq!(rows[0].to_string().trim(), all_tab_pr_row().to_string());
         assert_eq!(
             rows[0].to_string().trim(),
-            "[{ token = \"tab\", bold = true }, { token = \"$pr\", fg = \"#94e2d5\", bold = true }]"
+            "[{ token = \"tab\", bold = true }, { token = \"$pr\", fg = \"#b4befe\", bold = false, dim = false }]"
         );
         assert!(row_contains_token(&rows[1], "$quota_group"));
         let default =
@@ -2665,6 +2690,32 @@ rows = [["state_icon", "agent"]]
                 .filter(|row| row_contains_token(row, "tab"))
                 .count();
             assert_eq!(tabs, 1, "{layout:?}");
+        }
+    }
+
+    #[test]
+    fn earlier_head_row_colours_are_replaced_in_both_scopes() {
+        let marker = identity::row_marker();
+        for legacy in [
+            "[{ token = \"tab\", bold = true }, { token = \"$pr\", fg = \"#94e2d5\", bold = true }]",
+            "[{ token = \"tab\", bold = true, dim = false }], [{ token = \"$pr\", bold = false, dim = true }]",
+        ] {
+            let input = format!("[ui.sidebar.agents]\nrows = [{legacy}] # {marker}\n");
+            for layout in SidebarLayout::CHOICES {
+                for scope in [AgentScope::All, AgentScope::Workspace] {
+                    let rows = |config: &str| {
+                        managed_rows(config)
+                            .iter()
+                            .map(|row| row.to_string())
+                            .collect::<Vec<_>>()
+                    };
+                    assert_eq!(
+                        rows(&scoped(&input, layout, scope)),
+                        rows(&scoped("", layout, scope)),
+                        "{layout:?} {scope:?}"
+                    );
+                }
+            }
         }
     }
 
