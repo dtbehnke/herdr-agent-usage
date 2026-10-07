@@ -617,6 +617,12 @@ fn build_managed_rows(
                     if is_official_identity_row(&cleaned) || is_navigation_identity_row(&cleaned) {
                         continue;
                     }
+                    // The workspace head is `[tab]` + `[$pr]`; a hand-made
+                    // `[tab]` / `[tab, $pr]` row (the old first row) is the
+                    // same thing, so replacing it avoids a second tab.
+                    if scope.is_workspace() && is_tab_pr_row(&cleaned) {
+                        continue;
+                    }
                     rows.push(Value::Array(cleaned));
                 }
             }
@@ -1043,6 +1049,12 @@ fn append_scope_head_rows(rows: &mut Array, scope: AgentScope) {
 /// (`#5982 ● ↑251`), so the row renders that one token. Adding the field tokens
 /// beside it would print every field twice.
 const PR_TOKEN: &str = "$pr";
+
+/// Exactly `[tab]` or `[tab, $pr]`, with any styling.
+fn is_tab_pr_row(row: &Array) -> bool {
+    let names: Vec<_> = row.iter().filter_map(configured_token_name).collect();
+    names.len() == row.len() && (names == ["tab"] || names == ["tab", PR_TOKEN])
+}
 
 fn workspace_tab_row() -> Value {
     Value::Array(styled_row("tab", None, Some(true), Some(false)))
@@ -2561,6 +2573,55 @@ rows = [["state_icon", "agent"]]
             remove_quota_row_for(&managed, &AgentSelection::SUPPORTED, true).unwrap(),
             ""
         );
+    }
+
+    #[test]
+    fn a_hand_made_tab_pr_row_is_replaced_by_the_workspace_head() {
+        // Marked rows are the plugin's to rewrite; the hand-made row sits in them.
+        let marker = identity::row_marker();
+        let user = format!(
+            "[ui.sidebar.agents]\nrows = [[{{ token = \"tab\", bold = true }}, \
+             {{ token = \"$pr\", fg = \"#94e2d5\" }}]] # {marker}\n"
+        );
+        let user = user.as_str();
+        let layout = SidebarLayout::Packed;
+        let workspace = scoped(user, layout, AgentScope::Workspace);
+        let rows = managed_rows(&workspace);
+        let count = |token: &str| {
+            rows.iter()
+                .filter(|row| row_contains_token(row, token))
+                .count()
+        };
+        assert_eq!(count("tab"), 1, "{workspace}");
+        assert_eq!(count("$pr"), 1, "{workspace}");
+        assert_eq!(rows[0].as_array().unwrap().len(), 1);
+        assert_eq!(workspace, scoped(&workspace, layout, AgentScope::Workspace));
+        // `[tab]` alone goes the same way, and a row with other tokens stays.
+        let tab_only = scoped(
+            &format!(
+                "[ui.sidebar.agents]\nrows = [[\"tab\"], [\"tab\", \"git_branch\"]] # {marker}\n"
+            ),
+            layout,
+            AgentScope::Workspace,
+        );
+        let rows = managed_rows(&tab_only);
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row_contains_token(row, "tab"))
+                .count(),
+            2
+        );
+        assert!(rows.iter().any(|row| row_contains_token(row, "git_branch")));
+        // Scope `all` keeps it as a user row, exactly once.
+        let all = scoped(user, layout, AgentScope::All);
+        let rows = managed_rows(&all);
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row_contains_token(row, "tab"))
+                .count(),
+            1
+        );
+        assert!(row_contains_token(&rows[0], "$quota_group"));
     }
 
     fn row_contains_token(row: &Value, token: &str) -> bool {
